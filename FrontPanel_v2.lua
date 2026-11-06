@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="5.7-border-diagnostics"
+local VERSION="6.0-match-recorder"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -18,7 +18,7 @@ local options={queue=false,spawn=false,expand=false,attack=false,defend=false,le
  protect=true,cities=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
- growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
+ recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
 if type(getgenv)=="function" then
@@ -66,6 +66,149 @@ end
 local state={phase="waiting",players={},allies={},teams={},board={},incoming={},outgoing={},
  ready=false,frontier={},representatives={},pending={},generation=0,lastPlayers=0,
  lastFronts=0,lastAction=-100,spawnAt=-100,spawned=false,errorCount=0}
+local Recorder={schema=1,started=os.clock(),seq=0,roundStarted=os.clock(),round=nil,
+ ring={},head=1,tail=0,bytes=0,pending={},pendingBytes=0,parts={},part=0,
+ dropped=0,total=0,lastFlush=os.clock(),lastSample=-100,lastDecision=-100,systems={},rates={},lastByKind={}}
+Recorder.session=os.date("%Y%m%d_%H%M%S").."_"..tostring(math.floor(os.clock()*1000)).."_"..tostring(math.random(100000,999999))
+if type(Http.GenerateGUID)=="function" then
+ local ok,guid=pcall(function() return Http:GenerateGUID(false) end)
+ if ok then Recorder.session=Recorder.session.."_"..guid end
+end
+Recorder.prefix="frontpanel_data_"..Recorder.session
+Recorder.disk=type(writefile)=="function"
+Recorder.maxBytes=2*1024*1024
+Recorder.maxPartBytes=512*1024
+Recorder.maxParts=64
+function Recorder.safe(value,depth,seen,budget)
+ depth=depth or 0;seen=seen or {};budget=budget or {left=12000}
+ local kind=typeof(value)
+ if kind=="nil" or kind=="boolean" then return value end
+ if kind=="number" then return value==value and math.abs(value)<math.huge and value or tostring(value) end
+ if kind=="string" then return #value<=4096 and value or value:sub(1,4096).."[truncated]" end
+ if kind=="buffer" then
+  local header={}
+  for i=0,math.min(16,buffer.len(value))-1 do header[#header+1]=string.format("%02x",buffer.readu8(value,i)) end
+  return {type="buffer",bytes=buffer.len(value),header=table.concat(header," "),content="not recorded"}
+ end
+ if kind~="table" then return {type=kind} end
+ if seen[value] then return "[cycle]" end
+ if depth>=8 then return "[depth limit]" end
+ seen[value]=true
+ local result={};local count=0
+ for key,item in pairs(value) do
+  if budget.left<=0 or count>=2048 then result._truncated=true;break end
+  budget.left-=1;count+=1
+  result[tostring(key)]=Recorder.safe(item,depth+1,seen,budget)
+ end
+ seen[value]=nil
+ return result
+end
+function Recorder.emit(kind,data)
+ if not options.recordData then return false end
+ Recorder.seq+=1
+ local event={schema=Recorder.schema,session=Recorder.session,seq=Recorder.seq,
+  utc=os.date("!%Y-%m-%dT%H:%M:%SZ"),elapsed=os.clock()-Recorder.started,
+  round=state.round,roundElapsed=os.clock()-Recorder.roundStarted,generation=state.generation,
+  kind=kind,data=Recorder.safe(data)}
+ local ok,line=pcall(function() return Http:JSONEncode(event).."\n" end)
+ if not ok then Recorder.error="JSON: "..tostring(line);return false end
+ if #line>Recorder.maxPartBytes then Recorder.error="Gebeurtenis te groot";Recorder.dropped+=1;return false end
+ Recorder.total+=1;Recorder.tail+=1;Recorder.ring[Recorder.tail]=line;Recorder.bytes+=#line
+ while Recorder.bytes>Recorder.maxBytes and Recorder.head<=Recorder.tail do
+  Recorder.bytes-=#Recorder.ring[Recorder.head];Recorder.ring[Recorder.head]=nil;Recorder.head+=1;Recorder.dropped+=1
+ end
+ if Recorder.head>4096 then
+  local compact={}
+  for i=Recorder.head,Recorder.tail do compact[#compact+1]=Recorder.ring[i] end
+  Recorder.ring=compact;Recorder.head=1;Recorder.tail=#compact
+ end
+ if Recorder.disk and Recorder.part<Recorder.maxParts then
+  if Recorder.pendingBytes+#line>Recorder.maxPartBytes then Recorder.flush(true) end
+  if Recorder.disk and Recorder.part<Recorder.maxParts then
+   Recorder.pending[#Recorder.pending+1]=line;Recorder.pendingBytes+=#line
+  end
+ end
+ return true
+end
+function Recorder.flush(force)
+ if not Recorder.disk or Recorder.pendingBytes==0 then return end
+ if not force and os.clock()-Recorder.lastFlush<5 and Recorder.pendingBytes<128*1024 then return end
+ if Recorder.part>=Recorder.maxParts then Recorder.error="Bestandslimiet bereikt; recent geheugen blijft beschikbaar";return end
+ local path=Recorder.prefix..string.format("_part%03d.jsonl",Recorder.part+1)
+ local ok,err=pcall(writefile,path,table.concat(Recorder.pending))
+ Recorder.lastFlush=os.clock()
+ if not ok then Recorder.error="Opslaan: "..tostring(err);Recorder.disk=false;return end
+ Recorder.part+=1;Recorder.parts[#Recorder.parts+1]=path
+ Recorder.pending={};Recorder.pendingBytes=0
+ local manifest={schema=1,version=VERSION,session=Recorder.session,parts=Recorder.parts,
+  latestSequence=Recorder.seq,memoryDropped=Recorder.dropped,partLimit=Recorder.maxParts,
+  note="JSONL parts in sequence; client observations only; sampled players every 2 seconds; no full map buffers"}
+ local saved,fault=pcall(function() writefile(Recorder.prefix.."_index.json",Http:JSONEncode(manifest)) end)
+ if not saved then Recorder.error="Index: "..tostring(fault) end
+end
+function Recorder.memory_text()
+ local lines={}
+ for i=Recorder.head,Recorder.tail do lines[#lines+1]=Recorder.ring[i] end
+ return table.concat(lines)
+end
+function Recorder.export()
+ Recorder.emit("export",{lastSequence=Recorder.seq,memoryDropped=Recorder.dropped,diskParts=Recorder.part,error=Recorder.error})
+ Recorder.flush(true)
+ local chunks={};local complete=Recorder.disk and type(readfile)=="function" and Recorder.part>0
+ if complete then
+  for _,path in ipairs(Recorder.parts) do
+   local ok,text=pcall(readfile,path)
+   if not ok then complete=false;break end
+   chunks[#chunks+1]=text
+  end
+ end
+ local body=complete and table.concat(chunks) or Recorder.memory_text()
+ local metadata={schema=1,session=Recorder.session,kind="export_manifest",version=VERSION,
+  lastSequence=Recorder.seq,parts=Recorder.part,partLimitReached=Recorder.part>=Recorder.maxParts,
+  memoryDropped=Recorder.dropped,source=complete and "disk_parts" or "recent_memory",
+  firstRetainedMemorySequence=Recorder.seq-(Recorder.tail-Recorder.head),
+  error=Recorder.error,samplingSeconds=2,fullMapRecorded=false,
+  note="Client-visible observations; unknown and sampled data are not a complete server replay. Numeric dictionary keys are strings."}
+ local text=Http:JSONEncode(metadata).."\n"..body
+ local path=Recorder.prefix..(complete and "_export.jsonl" or "_recent.jsonl")
+ if type(writefile)=="function" then
+  local ok,err=pcall(writefile,path,text)
+  if ok then return path,(complete and Recorder.part<Recorder.maxParts) and "Opgeslagen" or "Gedeeltelijke tijdlijn; zie exportmetadata" end
+  Recorder.error=tostring(err)
+ end
+ if type(setclipboard)=="function" then
+  local ok=pcall(setclipboard,text)
+  if ok then return nil,"Recente tijdlijn naar klembord gekopieerd" end
+ end
+ return nil,"Geen bestand of klembord beschikbaar; gebruik Toon recente data"
+end
+function Recorder.system(name,status,detail)
+ local old=Recorder.systems[name]
+ local entry={status=status,detail=detail or "",at=os.clock()}
+ Recorder.systems[name]=entry
+ if not old or old.status~=status or old.detail~=entry.detail or entry.at-old.at>=10 then
+  Recorder.emit("system",{name=name,status=status,detail=entry.detail})
+ end
+end
+function Recorder.receive(kind,payload,extra)
+ local rate=Recorder.rates[kind] or {count=0,bytes=0};Recorder.rates[kind]=rate
+ rate.count+=1
+ if typeof(payload)=="buffer" then rate.bytes+=buffer.len(payload) end
+ local now=os.clock()
+ if kind=="init" then
+  if Recorder.round~=payload.round then Recorder.roundStarted=now;Recorder.round=payload.round end
+ end
+ if kind=="players" or kind=="fronts" or kind=="armies" or kind=="vehicles" then
+  if now-(Recorder.lastByKind[kind] or -100)<2 then return end
+  Recorder.lastByKind[kind]=now
+ end
+ Recorder.emit("server."..tostring(kind),{payload=payload,extra=extra,lastSentSerial=state.orderSerial,lastSentOrder=state.lastCommand,correlation="context only; not a guaranteed acknowledgement match"})
+end
+Recorder.emit("session",{version=VERSION,placeId=game.PlaceId,gameId=game.GameId,settings=options,
+ fileSupport=Recorder.disk,clipboardSupport=type(setclipboard)=="function",
+ limits={memoryBytes=Recorder.maxBytes,partBytes=Recorder.maxPartBytes,parts=Recorder.maxParts,playerSampleSeconds=2},
+ scope="Client-visible data only. Buffers summarized; normalized player/front/structure records stored separately. No inferred enemy gold or hidden orders."})
+
 local history,toggles,tabs={},{},{}
 local status,logbox,startup
 local ui_loaded=false
@@ -105,6 +248,9 @@ local collapsed=false
 local expanded=panel.Size
 local function cleanup()
  if not alive then return end
+ Recorder.emit("stop",{reason="UI closed"})
+ local path,message=Recorder.export()
+ print("[FrontPanel] "..message..(path and (": "..path) or ""))
  alive=false
  state.generation=state.generation+1
  for _,c in ipairs(connections) do c:Disconnect() end
@@ -134,6 +280,7 @@ startup.BackgroundColor3=Color3.fromRGB(20,25,35)
 startup.ZIndex=20
 startup.Parent=panel
 local function log(message)
+ Recorder.emit("log",{message=tostring(message)})
  local line=os.date("%H:%M:%S").." "..tostring(message)
  table.insert(history,line)
  if #history>40 then table.remove(history,1) end
@@ -201,7 +348,7 @@ local function button(tab,text,callback)
 end
 local function toggle(tab,name,key)
  toggles[key]={name=name,button=button(tab,name,function()
-  options[key]=not options[key];state.reason=nil;refresh_toggles();save_settings()
+  Recorder.emit("settings",{key=key,value=not options[key]});options[key]=not options[key];state.reason=nil;refresh_toggles();save_settings()
   log(name..": "..tostring(options[key]))
   if key=="dry" then log(options.dry and "Observatie: geen spelorders." or "Actieve modus: ingeschakelde functies versturen orders.") end
  end)}
@@ -212,13 +359,13 @@ local function number_input(tab,name,key,lo,hi)
   BackgroundColor3=Color3.fromRGB(40,45,60),TextColor3=Color3.new(1,1,1),TextSize=16,ClearTextOnFocus=false})
  box.FocusLost:Connect(function()
   local value=tonumber(box.Text)
-  if value and value==value and value>=lo and value<=hi then options[key]=value;save_settings() end
+  if value and value==value and value>=lo and value<=hi then Recorder.emit("settings",{key=key,value=value});options[key]=value;save_settings() end
   box.Text=tostring(options[key])
  end)
 end
 local ui_ok,ui_error=xpcall(function()
  panel.ClipsDescendants=true
- for i,name in ipairs({"Overzicht","Match","Oorlog","Instellen","Foutlog"}) do
+ for i,name in ipairs({"Overzicht","Match","Oorlog","Instellen","Foutlog","Data"}) do
   local page=Instance.new("ScrollingFrame")
   page.Position=UDim2.new(0,112,0,44)
   page.Size=UDim2.new(1,-120,1,-90)
@@ -230,7 +377,7 @@ local ui_ok,ui_error=xpcall(function()
   page.Parent=panel
   tabs[name]={page=page,y=0,selected=false}
   local name_copy=name
-  simple_button(name,5,44+(i-1)*40,100,35,panel).Activated:Connect(function() select_tab(name_copy) end)
+  simple_button(name,5,44+(i-1)*34,100,30,panel).Activated:Connect(function() select_tab(name_copy) end)
  end
  status=label("Overzicht","Spelverbinding wordt geladen...",400)
  label("Overzicht","Zet de gewenste functies aan. ACTIEF voert orders uit. OBSERVATIE toont alleen plannen. Instellingen worden automatisch opgeslagen wanneer je executor dit ondersteunt.",100)
@@ -276,6 +423,30 @@ local ui_ok,ui_error=xpcall(function()
  number_input("Instellen","Rustige uitbreiding: minimale reserve %","growthFloor",15,60)
  number_input("Instellen","Seconden tussen versterkingen per doel","reinforceDelay",4,30)
  number_input("Instellen","Extra orders zonder terreinwinst per doel","maxBoosts",1,5)
+ toggle("Data","Wedstrijd opnemen","recordData")
+ label("Data","Automatisch: alle zichtbare spelers elke 2 seconden, fronten, gebouwen, orders, fouten en plannerredenen. Buffers krijgen een samenvatting. Opslag maximaal 32 MB per uitvoering; geheugen bewaart de recentste 2 MB.",125)
+ button("Data","Exporteer wedstrijddata",function()
+  local path,message=Recorder.export()
+  log(message..(path and (": "..path) or ""))
+  Recorder.exportStatus.Text=message..(path and ("\n"..path) or "")
+ end)
+ button("Data","Markeer dit moment",function()
+  Recorder.emit("manual_marker",{reason=state.reason,phase=state.phase})
+  Recorder.flush(true);log("Moment gemarkeerd in de wedstrijddata.")
+ end)
+ Recorder.exportStatus=label("Data","Na de wedstrijd: Exporteer wedstrijddata. Stuur het export.jsonl-bestand uit de werkmap van je executor mee. Bij een teleport blijft het vorige bestand apart bewaard.",110)
+ button("Data","Kopieer recente data",function()
+  if type(setclipboard)=="function" then
+   local ok=pcall(setclipboard,Recorder.memory_text())
+   log(ok and "Recente data gekopieerd (maximaal 2 MB)." or "Kopiëren mislukt.")
+  else log("Geen klembordfunctie; gebruik export of Toon recente data.") end
+ end)
+ button("Data","Toon recente data",function()
+  Recorder.preview.Text=Recorder.memory_text():sub(-24000)
+ end)
+ Recorder.preview=row("Data","TextBox",{Size=UDim2.new(1,-10,0,400),Text="",TextSize=12,
+  TextColor3=Color3.new(1,1,1),BackgroundColor3=Color3.fromRGB(30,35,45),TextWrapped=true,
+  MultiLine=true,ClearTextOnFocus=false,TextEditable=true})
  button("Foutlog","Kopieer foutlog",function()
   if type(setclipboard)=="function" then setclipboard(table.concat(history,"\n"))
   else log("Geen klembordfunctie; maak een screenshot.") end
@@ -335,6 +506,8 @@ local function setup_reload()
  end
  state.reloadStatus="beschikbaar via executor"
  connect(player.OnTeleport,function(teleport_state)
+  Recorder.emit("teleport",{state=tostring(teleport_state)})
+  Recorder.flush(true)
   if teleport_state==Enum.TeleportState.Failed then state.teleportQueued=false;return end
   if not options.reload or state.teleportQueued then return end
   if teleport_state~=Enum.TeleportState.Started and teleport_state~=Enum.TeleportState.InProgress then return end
@@ -355,7 +528,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=5.7")
+]=],snapshot,RAW_URL.."?v=6.0")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -605,6 +778,9 @@ local function apply_delta(data)
         return pause_map(tostring(changes).." | header="..table.concat(prefix," "))
     end
     local touched={}
+    local deltaStats=Recorder.deltaStats or {packets=0,changes=0,transfers={}}
+    Recorder.deltaStats=deltaStats;deltaStats.packets+=1;deltaStats.changes+=#changes/2
+    deltaStats.firstAt=deltaStats.firstAt or os.clock();deltaStats.lastAt=os.clock()
     local changed=false
     for i=1,#changes,2 do
         local tile,owner=changes[i],changes[i+1]
@@ -614,6 +790,8 @@ local function apply_delta(data)
         if state.structures and state.structures[tile] then state.cityCache=nil end
         if owner==state.id then Strategy.sample_owned(tile) end
         if previous~=owner then
+            local key=tostring(previous)..">"..tostring(owner)
+            deltaStats.transfers[key]=(deltaStats.transfers[key] or 0)+1
             changed=true;touched[tile]=true
             neighbours(tile,function(other) touched[other]=true end)
         end
@@ -785,6 +963,7 @@ function Strategy.breakout_ratio(id,covered,support)
     local _,myCities=Strategy.city_value(state.id)
     local _,theirCities=Strategy.city_value(id)
     local advantage=enemy.isBot~=true and theirCities>myCities+1 and 1.35 or 1.15
+    if state.catchupActive then advantage=theirCities>myCities+1 and 1.18 or 1.08 end
     if me.troops+deployed*0.60<enemy.troops*advantage then return nil end
     local strongest,total=0,0
     for other,c in pairs(Strategy.contacts()) do
@@ -794,6 +973,7 @@ function Strategy.breakout_ratio(id,covered,support)
         end
     end
     local reserve=math.max(me.troops*0.25,strongest*0.55+total*0.10+enemy.troops*0.10)
+    if state.catchupActive then reserve=math.max(me.troops*0.30,strongest*0.35+total*0.08+enemy.troops*0.08) end
     local needed=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*(covered and 0.50 or 0.25))
     if support then needed=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*(covered and 0.24 or 0.12)) end
     local best=nil
@@ -811,7 +991,7 @@ function Strategy.breakout_plan(targets)
     local now=os.clock()
     state.boxedSince=state.boxedSince or now
     local progress=math.max(state.boxedSince,state.lastCaptureAt or 0,state.playingAt or 0)
-    if now-progress<30 or now-(state.lastBreakoutAt or -10000)<60 then return nil end
+    if now-progress<(state.catchupActive and 10 or 30) or now-(state.lastBreakoutAt or -10000)<60 then return nil end
     local best,bestRatio,bestReserve,bestScore=nil,nil,nil,-math.huge
     for id,tile in pairs(targets) do
         if id~=0 then
@@ -854,7 +1034,8 @@ function Strategy.update_catchup()
                 local army=entry.troops/math.max(1,me.troops)
                 local share=(entry.tiles or 0)/math.max(1,total)
                 local remainsDominant=id==previous and ((land>=1.60 and share>=0.25) or army>=2.40)
-                if remainsDominant or (land>=2 and share>=0.30) or army>=3 then
+                local fallingBehind=land>=1.20 and math.sqrt(land*army)>=1.45
+                if remainsDominant or fallingBehind or (land>=2 and share>=0.30) or army>=3 then
                     local score=land+army*0.5
                     if score>bestScore then best,bestScore=id,score end
                 end
@@ -871,7 +1052,8 @@ function Strategy.capacity_plan(targets)
     state.pressureReason=nil
     if not me or not options.attack or #state.incoming>0 then return nil end
     local fill=me.troops/Strategy.capacity(me)
-    if fill<(state.catchupActive and 0.60 or 0.80) then return nil end
+    local boxed=targets[0]==nil and not (options.rivers and state.waterTargets and state.waterTargets[0])
+    if fill<(state.catchupActive and (boxed and 0.50 or 0.60) or 0.80) then return nil end
     local busy={}
     for _,front in ipairs(state.outgoing) do busy[front.id]=true end
     if options.expand and targets[0] and not busy[0] then state.pressureReason="Hoge vulling: vrije grond heeft een beschikbare route";return nil end
@@ -887,6 +1069,7 @@ function Strategy.capacity_plan(targets)
     if Strategy.active_orders()>=limit then state.pressureReason="Fronten actief; defensief serverslot behouden";return nil end
     local best,bestRatio,bestHold,bestScore=nil,nil,nil,-math.huge
     local requiredLead=state.catchupActive and (fill>=0.85 and 1.20 or 1.40) or (fill>=0.90 and 1.25 or 1.60)
+    if state.catchupActive and boxed then requiredLead=1.08 end
     local considered=0
     for id,tile in pairs(targets) do
         local enemy=state.players[id]
@@ -904,6 +1087,7 @@ function Strategy.capacity_plan(targets)
                     local sent=math.floor(me.troops*preset)
                     if preset<=0.50 and sent>=needed and me.troops-sent>=hold and (not ratio or preset<ratio) then ratio=preset end
                 end
+                if state.catchupActive and boxed then ratio,hold=Strategy.breakout_ratio(id,state.targetProtected[id],false) end
                 local score=ratio and Strategy.target_score(id,tile,0,true)
                 if score and score>bestScore then best,bestRatio,bestHold,bestScore=id,ratio,hold,score end
             end
@@ -1415,9 +1599,16 @@ function Strategy.order_ready(kind)
     return os.clock()-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
 end
 local function send(payload,description)
-    if not Strategy.order_ready(payload.t) then return false end
+    if not Strategy.order_ready(payload.t) then
+        if os.clock()-(Recorder.lastByKind.order_wait or -100)>=2 then
+            Recorder.lastByKind.order_wait=os.clock()
+            Recorder.emit("order_deferred",{payload=payload,description=description,reason="shared cooldown",lastAction=state.lastAction,delay=Strategy.action_delay()})
+        end
+        return false
+    end
     state.lastAction=os.clock()
-    if options.dry then state.reason="Observatie: "..description;log("PLAN: "..description); return false end
+    if options.dry then Recorder.emit("plan_only",{payload=payload,description=description});state.reason="Observatie: "..description;log("PLAN: "..description); return false end
+    Recorder.emit("order",{payload=payload,description=description,serial=(state.orderSerial or 0)+1})
     folder.Intent:FireServer(payload)
     state.lastCommand=payload;state.orderSerial=(state.orderSerial or 0)+1
     if payload.t=="attack" then state.lastTroopOrder=os.clock() end
@@ -1932,6 +2123,7 @@ local function choose_spawn()
     return best
 end
 local function state_event(kind,payload,extra)
+    Recorder.receive(kind,payload,extra)
     if kind=="structs" and state.waitingDimensions then
         assert(#state.deferredStructures<128,"Te veel gebouwupdates tijdens kaartladen")
         state.deferredStructures[#state.deferredStructures+1]=payload
@@ -1958,6 +2150,12 @@ local function state_event(kind,payload,extra)
         if state.protocolBlocks then state.protocolBlocks.fronts=nil;state.protocolBlocks.diplomacy=nil end
         if state.protocolWarnings then state.protocolWarnings.fronts=nil;state.protocolWarnings.diplomacy=nil end
         if state.protocolWarningTypes then state.protocolWarningTypes.fronts=nil;state.protocolWarningTypes.diplomacy=nil end
+    end
+    if kind=="players" or kind=="fronts" or kind=="structs" or kind=="vehicles" or kind=="armies" or kind=="roster" then
+        local key="decoded."..kind
+        if kind=="structs" or kind=="roster" or os.clock()-(Recorder.lastByKind[key] or -100)>=2 then
+            Recorder.lastByKind[key]=os.clock();Recorder.emit(key,{payload=payload,extra=extra})
+        end
     end
     if kind=="init" then
         assert(type(payload)=="table" and type(payload.yourId)=="number","Onbekend init-formaat")
@@ -2242,7 +2440,7 @@ local function run_step_inner()
             state.lastAction=os.clock(); state.queueAt=os.clock()
             local slot=Matchmaker.SLOTS[chosen.slot]
             if options.dry then state.reason="Observatie: join wordt niet uitgevoerd";log("PLAN: join "..chosen.name)
-            else folder.LobbyIntent:FireServer("join",slot.key); state.reason="Join verstuurd: "..chosen.name;log("Join gevraagd: "..chosen.name) end
+            else Recorder.emit("order.lobby",{action="join",key=slot.key});folder.LobbyIntent:FireServer("join",slot.key); state.reason="Join verstuurd: "..chosen.name;log("Join gevraagd: "..chosen.name) end
         elseif not chosen then state.reason="Geen passende open match"
         end
         return
@@ -2418,7 +2616,7 @@ local function run_step_inner()
                 local boat=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
                 local invasionSafe=id==0 or (enemy and boat>=enemy.troops*(enemy.isBot==true and 1.1 or 1.5))
                 local pending=state.riverOrders[id]
-                if invasionSafe and (id==0 or attacksAllowed) and orderRatio and (not economic or economicReady) and score and not targets[id] and not busy[id] and not friendly(id)
+                if invasionSafe and (id==0 or attacksAllowed) and orderRatio and (not economic or economicReady) and score and (id==0 or not targets[id]) and (id==0 or not busy[id]) and not friendly(id)
                     and (not pending or pending.untilTime<=os.clock()) then
                     if score>waterScore then targetId,target,waterScore,waterRatio,waterReserve=id,entry,score,orderRatio,economic and economicReserve or normalReserve end
                 end
@@ -2460,7 +2658,168 @@ local function run_step_inner()
     end
 end
 
+function Recorder.sample()
+ if not options.recordData or os.clock()-Recorder.lastSample<2 then return end
+ Recorder.lastSample=os.clock()
+ local summaries={};local contacts={}
+ local totalLand,totalTroops=0,0
+ for _,entry in pairs(state.players) do
+  if entry.alive then totalLand+=entry.tiles or 0;totalTroops+=entry.troops or 0 end
+ end
+ if state.ready and state.owners then contacts=Strategy.contacts() end
+ local buildings={}
+ for tile,structure in pairs(state.structures or {}) do
+  local owner=structure.ownerId
+  if state.owners and tile>=0 and tile<buffer.len(state.owners) then owner=buffer.readu8(state.owners,tile) end
+  local counts=buildings[owner] or {cities=0,levels=0,defenses=0,sams=0,unfinished=0};buildings[owner]=counts
+  if structure.kind==1 then counts.cities+=1;counts.levels+=structure.level or 1 end
+  if structure.kind==3 then counts.defenses+=1 end
+  if structure.kind==5 then counts.sams+=1 end
+  if structure.uc then counts.unfinished+=1 end
+ end
+ for id,entry in pairs(state.players) do
+  local copy=table.clone(entry)
+  copy.knownLandShare=entry.tiles/math.max(1,totalLand)
+  copy.knownArmyShare=entry.troops/math.max(1,totalTroops)
+  copy.buildings=buildings[id];copy.territoryGainPerSecond=state.territoryGrowth and state.territoryGrowth[id]
+  copy.friendly=friendly(id);copy.contact=contacts[id]~=nil;copy.userId=state.rosterUsers and state.rosterUsers[id]
+  local previous=Recorder.previousPlayers and Recorder.previousPlayers[id]
+  if previous and previous.generation==state.generation then
+   local elapsed=os.clock()-previous.at
+   if elapsed>0 then copy.troopNetRate=(entry.troops-previous.troops)/elapsed;copy.tileNetRate=(entry.tiles-previous.tiles)/elapsed end
+  end
+  summaries[#summaries+1]=copy
+ end
+ Recorder.previousPlayers={}
+ for id,entry in pairs(state.players) do Recorder.previousPlayers[id]={troops=entry.troops,tiles=entry.tiles,at=os.clock(),generation=state.generation} end
+ table.sort(summaries,function(a,b) return a.id<b.id end)
+ local me=state.players[state.id]
+ Recorder.emit("world",{players=summaries,selfId=state.id,phase=state.phase,mapId=state.mapId,
+  width=W,height=H,mapRevision=state.mapRevision,ready=state.ready,
+  gold=state.gold,capacity=me and Strategy.capacity(me),measuredGrowth=state.measuredGrowth,
+  ownLossRate=state.homeLossRate,allies=state.allies,teams=state.teams,
+  incoming=state.incoming,outgoing=state.outgoing,
+  costs={city=state.cityCost,defense=state.postCost,sam=state.samCost,reinforce=state.reinforceCost},
+  reinforceTroops=state.reinforceTroops,reinforceReadyAt=state.reinforceReadyAt,
+  free={cities=state.freeCities,posts=state.freePosts,sams=state.freeSams,nukes=state.freeNukes},
+  playerAge=os.clock()-state.lastPlayers,frontAge=os.clock()-state.lastFronts,
+  messages=Recorder.rates,delta=Recorder.deltaStats,protocolWarnings=state.protocolWarnings,
+  engineFault=state.engineFault,mapFault=state.mapFault})
+ Recorder.rates={};Recorder.deltaStats=nil
+ if Recorder.lastStructureGeneration~=state.generation or os.clock()-(Recorder.lastStructureBaseline or -100)>=30 then
+  Recorder.lastStructureGeneration=state.generation;Recorder.lastStructureBaseline=os.clock()
+  Recorder.emit("structure_baseline",{complete=state.structuresReady,structures=state.structures})
+ end
+end
+function Recorder.decisions()
+ if not options.recordData or os.clock()-Recorder.lastDecision<2 then return end
+ Recorder.lastDecision=os.clock()
+ local alternatives={};local me=state.players[state.id]
+ local borders={}
+ if state.ready and state.owners then
+  for tile in pairs(state.frontier) do
+   if tile>=0 and tile<buffer.len(state.owners) then
+    local owner=buffer.readu8(state.owners,tile)
+    local entry=borders[owner] or {count=0,samples={}};borders[owner]=entry
+    entry.count+=1
+    if #entry.samples<16 then entry.samples[#entry.samples+1]=tile end
+   end
+  end
+ end
+ if state.ready and state.owners and me then
+  for id,contact in pairs(Strategy.contacts()) do
+   local enemy=state.players[id]
+   local covered=state.targetProtected and state.targetProtected[id] or false
+   local ratio,reserve=Strategy.opportunity_ratio(id,covered)
+   local score=Strategy.target_score(id,contact.tile,nil,false)
+   local reason=not options.attack and "attack disabled" or not fresh() and "stale state"
+    or #state.incoming>0 and "defense arbitration active"
+    or not ratio and "normal attack budget/strength gate" or "normal budget feasible; selection competes with other work"
+   alternatives[#alternatives+1]={id=id,tile=contact.tile,border=contact.border,troops=enemy.troops,
+    score=score,ratio=ratio,reserve=reserve,covered=covered,reason=reason,
+    route=state.waterTargets and state.waterTargets[id],cities=Strategy.city_value(id)}
+  end
+ end
+ table.sort(alternatives,function(a,b) return (a.score or -math.huge)>(b.score or -math.huge) end)
+ Recorder.emit("decision",{reason=state.reason,alternatives=alternatives,systems=Recorder.systems,
+  catchup=state.catchupActive,leader=state.catchupLeader,pressure=state.pressureReason,
+  requiredReserve=state.requiredReserve,economicReserve=state.economicReserve,
+  fronts=state.planFrontLimit or options.maxFronts,lastOrder=state.lastCommand,
+  borderTargets=borders,waterTargets=state.waterTargets,transportCount=state.transportCount,
+  pendingTransports=state.riverOrders,blockedLandings=state.blockedLanding,
+  pendingBlasts=state.plannedBlasts,lastBuild=state.lastBuild,lastNuke=state.lastNuke,
+  lastAction=state.lastAction,actionDelay=Config and Strategy.action_delay(),
+  timeSinceCapture=os.clock()-(state.lastCaptureAt or os.clock()),
+  counterReason=state.counterReason,nukeReason=state.nukeReason,
+  waterReason=state.waterSearchInfo,settings=options})
+end
+function Recorder.render()
+ local lines={}
+ for _,name in ipairs({"Data","Verdediging","Uitbreiding","Economie","Nukes","Routes","Versterken"}) do
+  local entry=Recorder.systems[name]
+  if entry then lines[#lines+1]=name..": "..entry.status.." | "..entry.detail.." ("..math.floor(os.clock()-entry.at).."s)" end
+ end
+ if Recorder.systemLabel then Recorder.systemLabel.Text=table.concat(lines,"\n") end
+ if Recorder.healthLabel then Recorder.healthLabel.Text=string.format("Opname: %s | %d gebeurtenissen | %d/%d delen | %d KB geheugen\n%s",
+  options.recordData and "AAN" or "UIT",Recorder.total,Recorder.part,Recorder.maxParts,math.floor(Recorder.bytes/1024),
+  Recorder.error or (Recorder.disk and "Bestanden worden automatisch opgeslagen." or "Geheugenopname; exporteer of kopieer vóór afsluiten.")) end
+end
+function Recorder.tick_inner()
+ local now=os.clock()
+ Recorder.system("Data",state.ready and "gereed" or "wachten",state.engineFault or state.mapFault or
+  string.format("spelers %.1fs / fronten %.1fs oud",now-state.lastPlayers,now-state.lastFronts))
+ Recorder.system("Uitbreiding",options.expand and "ingeschakeld" or "uit",state.reason or "wachten op planner")
+ local defense=Recorder.systems.Verdediging
+ if #state.incoming==0 then Recorder.system("Verdediging",options.defend and "bewaken" or "uit","geen gemelde inkomende fronten")
+ elseif not defense or now-defense.at>3 then Recorder.system("Verdediging",options.defend and "bedreigd" or "uit",state.counterReason or "inkomende fronten beoordelen") end
+ Recorder.sample();Recorder.decisions();Recorder.flush(false);Recorder.render()
+ if state.phase~=Recorder.lastPhase then
+  Recorder.emit("phase_observed",{from=Recorder.lastPhase,to=state.phase});Recorder.lastPhase=state.phase
+  if state.phase=="ended" or state.phase=="finished" or state.phase=="results" then
+   local path,message=Recorder.export()
+   if Recorder.exportStatus then Recorder.exportStatus.Text=message..(path and ("\n"..path) or "") end
+  end
+ end
+end
+function Recorder.tick()
+ local previous=state.planContext
+ if not previous then state.planContext={} end
+ local ok,err=xpcall(Recorder.tick_inner,debug.traceback)
+ state.planContext=previous
+ if not ok then error(err,0) end
+end
+function Recorder.install_workers()
+ local workers={try_build="Economie",try_shield="Economie",try_nuke="Nukes",water_targets="Routes",
+  try_buy_reinforcements="Versterken",try_reinforce="Versterken",defense_harvest="Verdediging"}
+ for method,system in pairs(workers) do
+  local original=Strategy[method]
+  Strategy[method]=function(...)
+   local started=os.clock();local serial=state.orderSerial or 0
+   local result=table.pack(original(...))
+   local acted=(state.orderSerial or 0)>serial
+   local enabled=system=="Nukes" and options.nukes or system=="Routes" and options.rivers
+    or system=="Economie" and (options.cities or options.posts or options.sams)
+    or system=="Verdediging" and options.defend or system=="Versterken" and (options.reinforce or options.buyReinforcements)
+   local detail=system=="Nukes" and state.nukeReason or system=="Routes" and state.waterSearchInfo
+    or system=="Verdediging" and state.counterReason or method
+   Recorder.system(system,acted and "order verstuurd" or enabled and "beoordeeld" or "uit",detail)
+   if options.recordData and (acted or os.clock()-(Recorder.lastByKind[method] or -100)>=2) then
+    Recorder.lastByKind[method]=os.clock()
+    Recorder.emit("worker",{method=method,duration=os.clock()-started,acted=acted,result=result[1],detail=detail})
+   end
+   return table.unpack(result,1,result.n)
+  end
+ end
+end
+Recorder.systemLabel=label("Overzicht","Onderdeelstatussen worden geladen...",230)
+Recorder.healthLabel=label("Data","Opnamestatus wordt geladen...",90)
+Recorder.install_workers()
+for _,name in ipairs({"Data","Verdediging","Uitbreiding","Economie","Nukes","Routes","Versterken"}) do
+ Recorder.system(name,"wachten","nog niet beoordeeld")
+end
+
 local function run_step()
+    local stepStarted=os.clock()
     state.planContext={}
     local before=state.orderSerial or 0
     local ok,result=xpcall(function()
@@ -2472,6 +2831,11 @@ local function run_step()
         end
     end,debug.traceback)
     state.contactScansLast=(state.planContext and state.planContext.scans) or 0
+    if options.recordData and (not ok or os.clock()-stepStarted>=0.1) then
+        Recorder.emit("planner_timing",{duration=os.clock()-stepStarted,success=ok,contactScans=state.contactScansLast,error=not ok and tostring(result) or nil})
+    end
+    local telemetryOk,telemetryError=pcall(Recorder.tick)
+    if not telemetryOk then Recorder.error="Telemetrie: "..tostring(telemetryError);Recorder.render() end
     state.planContext=nil
     if not ok then error(result,0) end
     return result
@@ -2544,5 +2908,13 @@ task.spawn(guard(function()
     end
     setup_reload()
     log("Verbinding gereed. Modus: "..(options.dry and "OBSERVATIE" or "ACTIEF"))
+    Recorder.emit("runtime_config",{config=Config,attackPresets=Config.attackPresets(state.mode)})
+    task.spawn(function()
+        while alive do
+            local ok,err=pcall(Recorder.tick)
+            if not ok then Recorder.error="Telemetrie: "..tostring(err);Recorder.render() end
+            task.wait(1)
+        end
+    end)
     while alive do guard(run_step)(); task.wait(0.5) end
 end))
