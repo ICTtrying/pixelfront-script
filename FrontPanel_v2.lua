@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.8-opportunity-strategy"
+local VERSION="3.9-reinforcement-defense"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -18,7 +18,7 @@ local options={queue=false,spawn=false,expand=false,attack=false,defend=false,le
  protect=true,cities=true,posts=true,nukes=false,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,maxSams=4,botCities=true,preserveBotCities=true,
- growthAware=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
+ growthAware=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
 if type(getgenv)=="function" then
@@ -148,7 +148,7 @@ local function refresh_toggles()
  title.Text="FRONT PANEL 3.6 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
 local function halt(reason)
- for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams","reinforce"}) do options[key]=false end
+ for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams","reinforce","buyReinforcements"}) do options[key]=false end
  refresh_toggles()
  save_settings()
  state.reason=reason or "Gestopt"
@@ -249,6 +249,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Zwakke botsteden heel houden","preserveBotCities")
  toggle("Oorlog","Groeicurve benutten","growthAware")
  toggle("Oorlog","Lopende fronten versterken","reinforce")
+ toggle("Oorlog","Reinforcement met goud kopen","buyReinforcements")
  label("Oorlog","Nukes: alleen atoomwapens, alleen tegen een actief front, met meerdere steden binnen de zekere binnenradius. Geen eigen of geallieerde grond binnen de buitenradius. Beschikbare tokens en goud bepalen of een order mogelijk is.",160)
  toggle("Instellen","Observatiemodus","dry")
  button("Instellen","Echte acties aanzetten",function()
@@ -349,7 +350,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.8")
+]=],snapshot,RAW_URL.."?v=3.9")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -742,7 +743,13 @@ function Strategy.opportunity_ratio(id,covered)
     if not me or not enemy or not enemy.alive or friendly(id) or me.troops<=0 then return nil end
     if me.troops<enemy.troops*options.strength then return nil end
     local capacity=Strategy.capacity(me)
-    local required=math.min(capacity*options.reserve/100,me.troops*0.30)
+    local required=math.min(capacity*options.reserve/100,me.troops*(enemy.isBot==true and 0.30 or 0.40))
+    if enemy.isBot~=true and enemy.troops>me.troops*0.12 then
+        for _,front in ipairs(state.outgoing) do
+            local other=state.players[front.id]
+            if front.id~=id and other and other.isBot~=true and other.alive then return nil end
+        end
+    end
     if options.protect then required=math.max(required,Strategy.risk_reserve()) end
     local multiplier=covered and 2 or (enemy.isBot==true and 0.9 or 1.4)
     local needed=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*multiplier)
@@ -895,7 +902,7 @@ function Strategy.risk_reserve()
     local incoming=0
     for _,a in ipairs(state.incoming) do incoming=incoming+a.troops end
     state.strongestNeighbour=rawTop;state.weightedThreat=top;state.neighbourCount=count
-    return math.ceil(top*0.35+second*0.10+total*0.15+incoming*1.10)
+    return math.ceil(top*0.65+second*0.20+total*0.20+incoming*1.20)
 end
 function Strategy.sample_owned(tile)
     if not state.ownedSamples then state.ownedSamples={} end
@@ -971,7 +978,8 @@ function Strategy.build_spot(kind)
                     for _,c in pairs(contacts) do
                         local attacking=false
                         for _,a in ipairs(state.incoming) do if a.id==c.id then attacking=true;break end end
-                        if attacking or c.troops*Strategy.threat_factor(c.id)>=(state.weightedThreat or 0)*0.7 then
+                        if attacking or (state.players[c.id] and state.players[c.id].isBot~=true)
+                            or c.troops*Strategy.threat_factor(c.id)>=(state.weightedThreat or 0)*0.7 then
                             for _,point in ipairs(c.points) do border=math.min(border,Strategy.distance(tile,point)) end
                         end
                     end
@@ -1097,6 +1105,31 @@ function Strategy.try_nuke()
     end
     return true
 end
+function Strategy.try_buy_reinforcements()
+    if not options.buyReinforcements then return false end
+    local me=state.players[state.id]
+    if not me or not me.alive or not state.gold or state.reinforceDenied then return false end
+    local access,held=pcall(function() return player:GetAttribute("ConquestPass_BARRACKS") end)
+    if not access or held~=true then return false end
+    if not state.reinforceQuoteAt or os.clock()-state.reinforceQuoteAt>5 then return false end
+    if os.clock()<(state.reinforceCooldownUntil or 0) or os.clock()<(state.reinforceReadyAt or math.huge) or os.clock()<(state.reinforcePendingUntil or 0) then return false end
+    local cost,troops=state.reinforceCost,state.reinforceTroops
+    if type(cost)~="number" or cost<0 or type(troops)~="number" or troops<=0 or state.gold<cost then return false end
+    local cap=Strategy.capacity(me)
+    local room=math.max(0,cap-me.troops)
+    local benefit=math.min(room,troops)
+    local need=Strategy.risk_reserve()
+    local emergency=#state.incoming>0 or me.troops<need*1.15
+    local active=#state.outgoing>0
+    local useful=benefit>=math.min(cap*0.10,troops*0.80)
+    if benefit<=0 or not useful then return false end
+    if not emergency and (not active or me.troops>=cap*0.65 or state.gold-cost<options.goldReserve) then return false end
+    if send({t="reinforce"},"reinforcement kopen: +"..math.floor(benefit).." troepen voor "..math.floor(cost).." goud") then
+        state.lastSend=os.clock();state.reinforcePendingUntil=os.clock()+8
+        return true
+    end
+    return false
+end
 function Strategy.city_affordable(cost,free,count,defensive)
     if free then return true end
     if type(cost)~="number" or cost<0 or not state.gold or state.gold<cost then return false end
@@ -1109,14 +1142,19 @@ function Strategy.try_build(defensive)
     local contacts=Strategy.contacts()
     local me=state.players[state.id]
     local highThreat=defensive
-    for id,c in pairs(contacts) do if c.troops*Strategy.threat_factor(id)>=me.troops*0.8 then highThreat=true end end
+    for id,c in pairs(contacts) do
+        local enemy=state.players[id]
+        if enemy and enemy.isBot~=true and (c.troops>=me.troops*0.35 or (state.levels or 0)>=3) then highThreat=true end
+        if c.troops*Strategy.threat_factor(id)>=me.troops*0.8 then highThreat=true end
+    end
     local kind,tile,cost,free=nil,nil,nil,false
     if options.posts and highThreat then
         local posts=0
         for _,s in pairs(state.structures) do if s.ownerId==state.id and s.kind==3 then posts=posts+1 end end
         if posts<math.max(1,math.min(5,state.neighbourCount or 1)) then
             free=(state.freePosts or 0)>0;cost=state.postCost
-            if free or (cost and state.gold-cost>=options.goldReserve) then tile=Strategy.build_spot(3);kind=3 end
+            local cashFloor=defensive and 0 or math.min(options.goldReserve,state.gold*0.20)
+            if free or (cost and state.gold-cost>=cashFloor) then tile=Strategy.build_spot(3);kind=3 end
         end
     end
     if not tile and options.sams and (defensive or Strategy.city_value(state.id)>=3 or not options.cities) then
@@ -1396,6 +1434,8 @@ local function state_event(kind,payload,extra)
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
         state.blockedBuild={};state.plannedBlasts={};state.gold=nil;state.cityCost=nil;state.postCost=nil
         state.freeCities=0;state.freePosts=0;state.freeNukes=0;state.freeSams=0;state.samCost=nil
+        state.reinforceCost=nil;state.reinforceTroops=nil;state.reinforceQuoteAt=nil
+        state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
         local roster=message_list("roster",payload.roster or {},false)
@@ -1460,6 +1500,12 @@ local function state_event(kind,payload,extra)
         end
         state.levels=payload.levels or 0; state.lastFronts=os.clock()
         state.gold=payload.gold or state.gold;state.cityCost=payload.cost or state.cityCost
+        if type(payload.reinforceCost)=="number" and type(payload.reinforceTroops)=="number" and type(payload.reinforceLeft)=="number"
+            and payload.reinforceCost>=0 and payload.reinforceTroops>=0 and payload.reinforceLeft>=0 then
+            state.reinforceCost=payload.reinforceCost;state.reinforceTroops=payload.reinforceTroops
+            state.reinforceQuoteAt=os.clock()
+            state.reinforceReadyAt=os.clock()+payload.reinforceLeft/(Config.TICK_RATE or 10)
+        end
         state.postCost=payload.postCost or state.postCost
         state.samCost=payload.samCost or state.samCost;state.freeSams=payload.freeSams or 0
         state.freeCities=payload.freeCities or 0;state.freePosts=payload.freePosts or 0;state.freeNukes=payload.freeNukes or 0
@@ -1488,6 +1534,14 @@ local function state_event(kind,payload,extra)
         elseif payload.kind==3 then state.postCost=payload.cost or state.postCost
         elseif payload.kind==5 then state.samCost=payload.cost or state.samCost end
         log("Bouw bevestigd op tegel "..tostring(payload.tile))
+    elseif kind=="reinforced" then
+        state.gold=payload.gold or state.gold
+        state.reinforcePendingUntil=0
+        state.reinforceReadyAt=os.clock()+(Config.REINFORCE_COOLDOWN or 300)/(Config.TICK_RATE or 10)
+        state.reinforceCooldownUntil=state.reinforceReadyAt
+        state.reinforceQuoteAt=nil
+        state.errorCount=0
+        log("Reinforcement bevestigd: +"..tostring(payload.troops or "?").." troepen; wachten op actuele legerstand.")
     elseif kind=="phase" then
         if state.phase~=payload.phase and payload.phase=="playing" then state.playingAt=os.clock() end
         state.phase=payload.phase
@@ -1509,8 +1563,13 @@ local function state_event(kind,payload,extra)
                 end
             end
         end
+        if command and command.t=="reinforce" then
+            state.reinforcePendingUntil=os.clock()+10
+            if payload.reason=="pass" then state.reinforceDenied=true;log("Reinforcement niet beschikbaar voor dit account.") end
+            state.reinforceQuoteAt=nil
+        end
         if command and command.t=="build" and state.blockedBuild then state.blockedBuild[command.tile]=os.clock()+45 end
-        local expected={gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true,
+        local expected={pass=true,gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true,
             busy=true,nobeach=true,nocoast=true,nosearoute=true,toomanytransportboats=true,toomanyfronts=true}
         if not expected[payload.reason] then state.errorCount=state.errorCount+1 end
         state.lastAction=os.clock()+5
@@ -1614,6 +1673,7 @@ local function run_step()
     if not fresh() then state.reason="Wachten op actuele troepen/fronten";return end
     if state.lastPlayers< (state.lastSend or -100) or state.lastFronts<(state.lastSend or -100) then state.reason="Wachten op server na order";return end
     Strategy.water_targets()
+    if Strategy.try_buy_reinforcements() then return end
     local ratio=choose_ratio(#state.incoming>0)
     local targets=enemy_targets()
     if #state.incoming>0 then
