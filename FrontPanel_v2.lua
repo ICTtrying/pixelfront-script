@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="4.8-active-defense"
+local VERSION="4.9-counter-pressure"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -353,7 +353,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=4.8")
+]=],snapshot,RAW_URL.."?v=4.9")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1293,9 +1293,9 @@ local function send(payload,description)
     return true
 end
 function Strategy.try_nuke()
-    if not options.nukes then return false end
+    if not options.nukes then state.nukeReason="UIT: schakel Strategische atoomnukes in";return false end
     if os.clock()-(state.lastNuke or -10000)<options.nukeDelay then state.nukeReason="Wachten op nuke-interval";return false end
-    if not state.structuresReady or not state.gold then return false end
+    if not state.structuresReady or not state.gold then state.nukeReason="Wachten op gebouw- en goudgegevens";return false end
     local free=(state.freeNukes or 0)>0
     if not free and state.gold-(Config.ATOM_BOMB_COST or 750000)<options.goldReserve then
         state.nukeReason="Onvoldoende nuke-budget: prijs "..tostring(Config.ATOM_BOMB_COST or 750000).." plus reserve "..options.goldReserve
@@ -1474,18 +1474,30 @@ function Strategy.defense_budget()
 end
 function Strategy.defense_ratio(id)
     local me,enemy=state.players[state.id],state.players[id]
-    if not me or not enemy or friendly(id) or not enemy.alive then return nil end
-    if state.lastPlayers<(state.lastSend or -100) then return nil end
-    local hold,critical=Strategy.defense_budget()
-    if critical or me.troops<enemy.troops*1.25 then return nil end
+    local function blocked(reason) state.counterReason=reason;return nil end
+    if not me or not enemy or friendly(id) or not enemy.alive then return blocked("Geen geldig vijandelijk doel") end
+    if state.lastPlayers<(state.lastSend or -100) then return blocked("Wachten op actuele troepen na vorige order") end
+    local incoming,attackers=0,{}
+    for _,front in ipairs(state.incoming) do incoming+=front.troops;attackers[front.id]=true end
+    if incoming>=me.troops*0.75 then return blocked("Inkomend leger te groot; noodverdediging krijgt voorrang") end
+    if me.troops<enemy.troops*0.90 then return blocked("Vijandelijk thuisleger te sterk voor beperkte tegendruk") end
+    local other=0
+    for otherId,contact in pairs(Strategy.contacts()) do
+        if not attackers[otherId] then other=math.max(other,contact.troops*Strategy.threat_factor(otherId)) end
+    end
+    local hold=math.max(Strategy.capacity(me)*0.12,me.troops*0.55,incoming*1.05+other*0.20)
     for _,front in ipairs(state.outgoing) do
-        if front.id==id and front.troops>=math.max(enemy.troops*0.15,(Config.MIN_ATTACK_TROOPS or 250)*4) then return nil end
+        if front.id==id and front.troops>=math.max(enemy.troops*0.15,(Config.MIN_ATTACK_TROOPS or 250)*4) then
+            return blocked("Tegenaanval loopt al met voldoende troepen")
+        end
     end
     local best=nil
     for _,ratio in ipairs(Config.attackPresets(state.mode)) do
         local committed=math.floor(me.troops*ratio)
-        if committed>=(Config.MIN_ATTACK_TROOPS or 250) and me.troops-committed>=hold and (not best or ratio<best) then best=ratio end
+        if ratio<=0.35 and committed>=(Config.MIN_ATTACK_TROOPS or 250) and me.troops-committed>=hold and (not best or ratio<best) then best=ratio end
     end
+    if not best then return blocked("Geen beschikbare troepenpreset past naast thuisreserve "..math.ceil(hold)) end
+    state.counterReason="Beperkte tegendruk: "..math.floor(best*100).."%; thuisreserve "..math.ceil(hold)
     return best
 end
 local function enemy_targets()
@@ -1742,7 +1754,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
-        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={}
+        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
@@ -2008,9 +2020,9 @@ local function run_step()
     local targets=enemy_targets()
     if #state.incoming>0 then
         state.reason="VERDEDIGEN: druk en beschikbare thuisreserve beoordelen"
+        state.counterReason=nil
         if defending and Strategy.try_buy_reinforcements() then return end
         if Strategy.try_nuke() then return end
-        if Strategy.try_build(true) then return end
         if options.defend then
             local worst=nil
             for _,attack in ipairs(state.incoming) do
@@ -2018,14 +2030,19 @@ local function run_step()
             end
             local defenseRatio=worst and os.clock()-(state.defenseCounterAt or -10000)>=6 and Strategy.defense_ratio(worst.id)
             if worst and defenseRatio then
-                if send({t="attack",tile=targets[worst.id],ratio=defenseRatio},"tegenaanval op "..worst.id) then state.lastSend=os.clock();state.defenseCounterAt=os.clock() end
+                if send({t="attack",tile=targets[worst.id],ratio=defenseRatio},"TEGENDRUK op "..worst.id.." | inzet "..math.floor(me.troops*defenseRatio).." | thuis "..(me.troops-math.floor(me.troops*defenseRatio)).." | nuke: "..(state.nukeReason or "niet beschikbaar")) then state.lastSend=os.clock();state.defenseCounterAt=os.clock() end
                 return
             else state.reason="Aanval binnenkomend; geen veilige tegenaanval beschikbaar" end
         else state.reason="Aanval binnenkomend; offensief gepauzeerd" 
         end
+        if Strategy.try_build(true) then return end
         if defending and Strategy.defense_harvest(targets) then return end
+        if os.clock()-(state.lastDefenseLog or -10000)>=8 then
+            log("VERDEDIGING: "..(options.defend and (state.counterReason or "Geen aangrenzende aanvalsroute of tegenaanval herstelt") or "Verdedigen staat UIT").." | NUKE: "..(state.nukeReason or "geen beschikbaar doel"))
+            state.lastDefenseLog=os.clock()
+        end
         local hold,critical=Strategy.defense_budget()
-        state.reason="VERDEDIGEN: "..(critical and "zware druk; noodreserve behouden" or "druk beheersbaar; geen betaalbare extra order").." | thuisreserve "..math.ceil(hold)
+        state.reason="VERDEDIGEN: "..(critical and "zware druk; " or "")..(state.counterReason or "tegenaanval loopt of wacht op herbeoordeling").." | thuisreserve "..math.ceil(hold)
         return
     end
     local mapGeneration=state.generation
