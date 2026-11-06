@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.3-bot-economy"
+local VERSION="3.4-message-types"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -143,7 +143,7 @@ local function refresh_toggles()
   item.button.Text=item.name..": "..(options[key] and "AAN" or "UIT")
   item.button.BackgroundColor3=options[key] and Color3.fromRGB(30,125,80) or Color3.fromRGB(35,80,145)
  end
- title.Text="FRONT PANEL 3.3 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
+ title.Text="FRONT PANEL 3.4 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
 local function halt(reason)
  for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams"}) do options[key]=false end
@@ -342,7 +342,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.3")
+]=],snapshot,RAW_URL.."?v=3.4")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -358,6 +358,88 @@ end
 local Config,Net,MapGen,Matchmaker,Scenarios,Nukes,folder
 local W,H,N
 local Strategy={}
+local message_decoders={
+    roster={"unpackRoster","decodeRoster"},
+    structs={"unpackStructs","unpackStructures","unpackStructEvents","unpackStructureEvents","decodeStructures"},
+    players={"unpackPlayers","decodePlayers"},
+    vehicles={"unpackVehicles","decodeVehicles"},
+    allies={"unpackAllies","unpackIds","unpackIdList"},
+    frontList={"unpackFrontList","unpackAttacks","unpackFronts"},
+    fronts={"unpackFronts","decodeFronts"},
+    diplomacy={"unpackDiplomacy","unpackDiplo"},
+}
+local function valid_list(kind,list)
+    if type(list)~="table" then return false end
+    local length=#list
+    local keys=0
+    for key in pairs(list) do
+        if type(key)~="number" or key%1~=0 or key<1 or key>length then return false end
+        keys=keys+1
+    end
+    if keys~=length then return false end
+    for _,entry in ipairs(list) do
+        if kind=="allies" then
+            if type(entry)~="number" then return false end
+        elseif type(entry)~="table" then return false
+        elseif kind=="structs" then
+            if type(entry.tile)~="number" or entry.tile<0 or entry.tile>=N
+                or type(entry.ownerId)~="number" or type(entry.level)~="number" then return false end
+        elseif kind=="roster" then
+            if type(entry.i)~="number" then return false end
+        elseif kind=="players" then
+            if type(entry.id)~="number" or type(entry.troops)~="number" or type(entry.tiles)~="number" or type(entry.alive)~="boolean" then return false end
+        elseif kind=="vehicles" then
+            if type(entry.owner)~="number" or type(entry.kind)~="number" then return false end
+        elseif kind=="frontList" then
+            if type(entry.id)~="number" or type(entry.troops)~="number" then return false end
+        end
+    end
+    return true
+end
+local function message_table(kind,payload)
+    if type(payload)=="table" then return payload end
+    for _,name in ipairs(message_decoders[kind] or {}) do
+        if Net and type(Net[name])=="function" then
+            local ok,result=pcall(Net[name],payload)
+            if ok and type(result)=="table" then return result end
+        end
+    end
+    return nil
+end
+local function message_issue(kind,payload,critical)
+    state.protocolWarnings=state.protocolWarnings or {}
+    state.protocolBlocks=state.protocolBlocks or {}
+    state.protocolWarningTypes=state.protocolWarningTypes or {}
+    local size=typeof(payload)=="buffer" and (", "..buffer.len(payload).." bytes") or ""
+    local message=kind..": ontvangen "..typeof(payload)..size.."; geen compatibele lijstdecoder"
+    local changed=state.protocolWarningTypes[kind]~=typeof(payload)
+    if changed then
+        state.protocolWarningTypes[kind]=typeof(payload)
+        state.protocolWarnings[kind]=message
+        log("BERICHTFORMAAT: "..message)
+        if not state.decoderNamesLogged then
+            local names={}
+            for name,fn in pairs(Net or {}) do
+                if type(name)=="string" and type(fn)=="function" and name:find("unpack",1,true) then names[#names+1]=name end
+            end
+            table.sort(names);log("Beschikbare decoders: "..table.concat(names,", "))
+            state.decoderNamesLogged=true
+        end
+    end
+    if critical then state.protocolBlocks[kind]=message end
+    if kind=="structs" then
+        state.structuresReady=false
+        if changed then log("Gebouwafhankelijke orders wachten op betrouwbare gebouwgegevens.") end
+    elseif kind=="vehicles" then state.transportKnown=false end
+end
+local function message_list(kind,payload,critical)
+    local list=message_table(kind,payload)
+    if not valid_list(kind,list) then message_issue(kind,payload,critical);return nil end
+    if state.protocolWarnings then state.protocolWarnings[kind]=nil end
+    if state.protocolWarningTypes then state.protocolWarningTypes[kind]=nil end
+    if state.protocolBlocks then state.protocolBlocks[kind]=nil end
+    return list
+end
 local function pause_map(reason)
     if not state.awaitingInit then
         state.generation=state.generation+1
@@ -1005,6 +1087,28 @@ local function choose_spawn()
     return best
 end
 local function state_event(kind,payload,extra)
+    if kind=="roster" or kind=="structs" or kind=="players" or kind=="vehicles" then
+        local list=message_list(kind,payload,kind=="players")
+        if not list then return end
+        payload=list
+    elseif kind=="fronts" then
+        local object=message_table("fronts",payload)
+        if not object then message_issue("fronts",payload,true);return end
+        local outgoing=message_table("frontList",object.out)
+        local incoming=message_table("frontList",object.inc)
+        if not valid_list("frontList",outgoing) or not valid_list("frontList",incoming) then
+            message_issue("fronts",payload,true);return
+        end
+        local diplo=object.diplo and message_table("diplomacy",object.diplo) or nil
+        if object.diplo~=nil and not diplo then message_issue("diplomacy",object.diplo,true);return end
+        local allies=message_list("allies",diplo and diplo.allies or {},true)
+        if not allies then return end
+        payload=table.clone(object);payload.out=outgoing;payload.inc=incoming
+        payload.diplo={allies=allies}
+        if state.protocolBlocks then state.protocolBlocks.fronts=nil;state.protocolBlocks.diplomacy=nil end
+        if state.protocolWarnings then state.protocolWarnings.fronts=nil;state.protocolWarnings.diplomacy=nil end
+        if state.protocolWarningTypes then state.protocolWarningTypes.fronts=nil;state.protocolWarningTypes.diplomacy=nil end
+    end
     if kind=="init" then
         assert(type(payload)=="table" and type(payload.yourId)=="number","Onbekend init-formaat")
         if state.round~=payload.round then state.resyncAttempts=0 end
@@ -1020,7 +1124,8 @@ local function state_event(kind,payload,extra)
         state.freeCities=0;state.freePosts=0;state.freeNukes=0;state.freeSams=0;state.samCost=nil
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
-        for _,entry in ipairs(payload.roster or {}) do state.rosterUsers[entry.i]=entry.u end
+        local roster=message_list("roster",payload.roster or {},false)
+        for _,entry in ipairs(roster or {}) do state.rosterUsers[entry.i]=entry.u end
         state.capBonus=payload.troopCapBonus or 0
         state.players={}; state.allies={}; state.incoming={}; state.outgoing={}
         state.frontier={}; state.representatives={}; state.pending={}
@@ -1060,7 +1165,7 @@ local function state_event(kind,payload,extra)
         for _,entry in ipairs(payload) do state.rosterUsers[entry.i]=entry.u end
     elseif kind=="players" and state.id then
         local players={}
-        for _,entry in ipairs(Net.unpackPlayers(payload)) do players[entry.id]=entry end
+        for _,entry in ipairs(payload) do players[entry.id]=entry end
         state.players=players; state.lastPlayers=os.clock()
     elseif kind=="fronts" and state.id then
         assert(type(payload.out)=="table" and type(payload.inc)=="table","Onbekend fronts-formaat")
@@ -1077,7 +1182,8 @@ local function state_event(kind,payload,extra)
         for _,id in ipairs(payload.diplo and payload.diplo.allies or {}) do state.allies[id]=true end
     elseif kind=="vehicles" and state.id then
         state.transportCount=0
-        for _,v in ipairs(Net.unpackVehicles(payload)) do
+        state.transportKnown=true
+        for _,v in ipairs(payload) do
             if v.owner==state.id and v.kind==3 then state.transportCount=state.transportCount+1 end
         end
     elseif kind=="structs" and state.id then
@@ -1085,7 +1191,7 @@ local function state_event(kind,payload,extra)
         state.structures=state.structures or {}
         for _,s in ipairs(payload) do
             if s.ownerId==0 or (s.level or 0)<=0 then state.structures[s.tile]=nil
-            else state.structures[s.tile]=s end
+            else local copy=table.clone(s);copy.kind=copy.kind or 1;state.structures[s.tile]=copy end
         end
         if extra then state.structuresReady=true end
         state.cityCache=nil
@@ -1142,15 +1248,24 @@ local function run_step()
         end
     end
     local me=state.players[state.id]
-    status.Text=string.format("Server: %s | %s\nKaart: %s | Troepen: %s\nInkomend: %d | Uitgaand: %d\nModus: %s\nOpslag: %s\nHerladen: %s\nSterkste buur: %s | Buren: %s\nReserve nodig: %s | Goud: %s\nStatus: %s",
+    local warnings={}
+    for kind in pairs(state.protocolWarnings or {}) do warnings[#warnings+1]=kind end
+    table.sort(warnings)
+    status.Text=string.format("Server: %s | %s\nKaart: %s | Troepen: %s\nInkomend: %d | Uitgaand: %d\nModus: %s\nOpslag: %s\nHerladen: %s\nSterkste buur: %s | Buren: %s\nReserve nodig: %s | Goud: %s\nBerichtwaarschuwingen: %s\nStatus: %s",
         tostring(role),tostring(state.phase),state.ready and "gereed" or "wachten",
         me and tostring(me.troops) or "onbekend",#state.incoming,#state.outgoing,
         options.dry and "OBSERVATIE: GEEN ORDERS" or "ACTIEF",storage_status,
         options.reload and (state.reloadStatus or "controleren") or "UIT",
         tostring(state.strongestNeighbour or "?"),tostring(state.neighbourCount or "?"),
-        tostring(state.requiredReserve or "?"),tostring(state.gold or "?"),state.reason or "Initialiseren")
+        tostring(state.requiredReserve or "?"),tostring(state.gold or "?"),
+        #warnings>0 and table.concat(warnings,", ") or "geen",state.reason or "Initialiseren")
     if state.engineFault then
         state.reason="Gepauzeerd na fout; instellingen behouden. Gebruik Synchroniseer opnieuw."
+        return
+    end
+    if state.protocolBlocks and next(state.protocolBlocks) then
+        local _,warning=next(state.protocolBlocks)
+        state.reason="Wachten op kritiek berichtformaat: "..warning
         return
     end
     if state.awaitingInit then
@@ -1231,7 +1346,8 @@ local function run_step()
     if Strategy.try_build(false) then return end
     if not ratio then state.reason="Troepen bewaren: reserve of sterke buurlanden vereisen meer verdediging";return end
     local active=Strategy.active_orders()
-    if active>=math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4) then
+    local allowedFronts=state.transportKnown==false and 1 or options.maxFronts
+    if active>=math.min(allowedFronts,Config.MAX_FRONTS_PER_PLAYER or 4) then
         state.reason="Frontenlimiet bereikt ("..active.."); bestaande legers/transporten afwachten";return
     end
     local busy={}
@@ -1252,7 +1368,7 @@ local function run_step()
             end
         end
         if not weakest then state.reason="Geen nieuw veilig landfront; wateroversteek onderzoeken" end
-        if options.rivers and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
+        if options.rivers and state.transportKnown~=false and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
             local targetId,target,waterScore=nil,nil,-math.huge
             for id,entry in pairs(state.waterTargets or {}) do
                 local score=id==0 and options.expand and 0 or Strategy.target_score(id,entry.tile,entry.distance)
