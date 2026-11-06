@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="4.7-adaptive-tempo"
+local VERSION="4.8-active-defense"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -353,7 +353,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=4.7")
+]=],snapshot,RAW_URL.."?v=4.8")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -962,6 +962,20 @@ function Strategy.sam_spot()
             end
         end
     end
+    for _,anchor in ipairs(important) do
+        local sx,sy,count=0,0,0
+        for _,city in ipairs(important) do
+            if Strategy.distance(anchor.tile,city.tile)<=coverage*0.65 then sx+=city.tile%W;sy+=math.floor(city.tile/W);count+=1 end
+        end
+        if count>=2 then
+            local cx,cy=math.floor(sx/count),math.floor(sy/count)
+            local offset=(Config.STRUCTURE_MIN_DIST or 15)+13
+            for _,delta in ipairs({{0,0},{offset,0},{-offset,0},{0,offset},{0,-offset}}) do
+                local x,y=cx+delta[1],cy+delta[2]
+                if x>=0 and x<W and y>=0 and y<H then candidates[#candidates+1]=y*W+x end
+            end
+        end
+    end
     for _,tile in pairs(state.ownedSamples or {}) do candidates[#candidates+1]=tile end
     local best,bestScore=nil,0
     for _,tile in ipairs(candidates) do
@@ -973,7 +987,12 @@ function Strategy.sam_spot()
             if clear then
                 local value=0
                 for _,city in ipairs(important) do
-                    if Strategy.distance(tile,city.tile)<=coverage*0.85 then value=value+(city.level or 1)+2 end
+                    local distance=Strategy.distance(tile,city.tile)
+                    if distance<=coverage*0.85 then
+                        local outer=Nukes and Nukes.magnitude and Nukes.magnitude(13)
+                        local margin=coverage-(outer and outer.outer or 30)-distance
+                        value+=((city.level or 1)+2)*(1+math.max(0,margin)/coverage)
+                    end
                 end
                 local score=value-Strategy.nearby_danger(tile)*2
                 if value>0 and score>bestScore then best,bestScore=tile,score end
@@ -1057,15 +1076,35 @@ function Strategy.build_spot(kind)
                 local score=nil
                 local blast=Nukes and Nukes.magnitude(13)
                 local ownCities=Strategy.city_value(state.id)
-                local citySpacing=ownCities<3 and spacing or (blast and blast.outer or 30)*2+8
-                if kind==1 and danger<1 and same>=citySpacing then
+                local citySpacing=spacing
+                local groupFit,groupBonus=true,0
+                if kind==1 and ownCities>0 then
+                    local cover=Nukes and Nukes.samRange and Nukes.samRange(1) or 70
+                    local anchors={}
+                    for _,city in pairs(state.structures) do
+                        if city.ownerId==state.id and city.kind==1 then
+                            local group=nil
+                            for _,anchor in ipairs(anchors) do if Strategy.distance(city.tile,anchor.tile)<=cover*0.55 then group=anchor;break end end
+                            if group then group.count+=1 else anchors[#anchors+1]={tile=city.tile,count=1} end
+                        end
+                    end
+                    groupFit=same>=(blast and blast.outer or 30)*2+8
+                    for _,anchor in ipairs(anchors) do
+                        local distance=Strategy.distance(tile,anchor.tile)
+                        if anchor.count<4 and distance<=cover*0.55 then groupFit=true;groupBonus=60-distance end
+                    end
+                    for _,sam in pairs(state.structures) do
+                        if sam.ownerId==state.id and sam.kind==5 and Strategy.distance(tile,sam.tile)<=cover*0.75 then groupBonus+=70;break end
+                    end
+                end
+                if kind==1 and danger<1 and same>=citySpacing and groupFit then
                     local own=0
                     local x,y=tile%W,math.floor(tile/W)
                     for _,d in ipairs({{12,0},{-12,0},{0,12},{0,-12},{18,18},{-18,-18},{18,-18},{-18,18}}) do
                         local px,py=x+d[1],y+d[2]
                         if px>=0 and px<W and py>=0 and py<H and buffer.readu8(state.owners,py*W+px)==state.id then own=own+1 end
                     end
-                    if own>=(ownCities<3 and 2 or 4) then score=own*10+math.min(same,70)-danger*80 end
+                    if own>=(ownCities<3 and 2 or 4) then score=own*10+groupBonus-danger*80 end
                 elseif kind==3 then
                     local border=math.huge
                     for _,c in pairs(contacts) do
@@ -1422,18 +1461,30 @@ local function choose_ratio(defending,economic)
     end
     return best
 end
+function Strategy.defense_budget()
+    local me=state.players[state.id]
+    if not me then return math.huge,true end
+    local incoming,attackers=0,{}
+    for _,front in ipairs(state.incoming) do incoming+=front.troops;attackers[front.id]=true end
+    local other=0
+    for id,c in pairs(Strategy.contacts()) do if not attackers[id] then other=math.max(other,c.troops*Strategy.threat_factor(id)) end end
+    local hold=math.max(Strategy.capacity(me)*0.20,me.troops*0.50,incoming*1.5+other*0.25)
+    local heavyLoss=(state.homeLossRate or 0)>math.max(5,me.tiles*0.002)
+    return hold,incoming>=me.troops*0.65 or (heavyLoss and incoming>=me.troops*0.15)
+end
 function Strategy.defense_ratio(id)
     local me,enemy=state.players[state.id],state.players[id]
     if not me or not enemy or friendly(id) or not enemy.alive then return nil end
     if state.lastPlayers<(state.lastSend or -100) then return nil end
-    local incoming=0
-    for _,front in ipairs(state.incoming) do incoming+=front.troops end
-    local hold=math.max(me.troops*0.65,incoming*1.20)
+    local hold,critical=Strategy.defense_budget()
+    if critical or me.troops<enemy.troops*1.25 then return nil end
+    for _,front in ipairs(state.outgoing) do
+        if front.id==id and front.troops>=math.max(enemy.troops*0.15,(Config.MIN_ATTACK_TROOPS or 250)*4) then return nil end
+    end
     local best=nil
     for _,ratio in ipairs(Config.attackPresets(state.mode)) do
         local committed=math.floor(me.troops*ratio)
-        if committed>=(Config.MIN_ATTACK_TROOPS or 250) and me.troops-committed>=hold
-            and me.troops>=enemy.troops*2 and (not best or ratio<best) then best=ratio end
+        if committed>=(Config.MIN_ATTACK_TROOPS or 250) and me.troops-committed>=hold and (not best or ratio<best) then best=ratio end
     end
     return best
 end
@@ -1582,6 +1633,46 @@ function Strategy.spawn_score(tile)
     if free<30 then return nil end
     return free*12+wide*5+math.min(nearest,300)-crowding-bit32.band(buffer.readu8(state.terrain,tile),63)*2
 end
+function Strategy.defense_harvest(targets)
+    local hold,critical=Strategy.defense_budget()
+    local me=state.players[state.id]
+    if critical or not me or not options.defend then return false end
+    if state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
+    if Strategy.active_orders()>=math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4) then return false end
+    local busy={}
+    for _,front in ipairs(state.outgoing) do busy[front.id]=true end
+    for _,front in ipairs(state.incoming) do busy[front.id]=true end
+    local best,bestRatio,bestScore=nil,nil,-math.huge
+    for id,tile in pairs(targets) do
+        local enemy=state.players[id]
+        if enemy and enemy.isBot==true and (options.attack or options.expand) and not busy[id]
+            and enemy.troops<=me.troops*0.10 then
+            local score=Strategy.target_score(id,tile,0)
+            for _,ratio in ipairs(Config.attackPresets(state.mode)) do
+                local committed=math.floor(me.troops*ratio)
+                if score and committed>=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*1.1)
+                    and me.troops-committed>=hold and (not best or score>bestScore or (id==best and ratio<bestRatio)) then
+                    best,bestRatio,bestScore=id,ratio,score
+                end
+            end
+        end
+    end
+    if best and send({t="attack",tile=targets[best],ratio=bestRatio},"ACTIEVE VERDEDIGING: goedkoop botland "..best.." veroveren; thuisreserve "..math.ceil(hold)) then
+        state.lastSend=os.clock();return true
+    end
+    return false
+end
+function Strategy.try_shield()
+    if not options.sams or not state.structuresReady or not state.gold or Strategy.city_value(state.id)<3
+        or os.clock()-(state.lastBuild or -10000)<options.buildDelay then return false end
+    local free=(state.freeSams or 0)>0
+    if not free and (not state.samCost or state.gold-state.samCost<options.goldReserve) then return false end
+    local tile=Strategy.sam_spot()
+    if tile and send({t="build",tile=tile,kind=5},"ANTI-NUKE: ongedekte huizengroep beschermen") then
+        state.lastBuild=os.clock();state.lastSend=os.clock();state.blockedBuild[tile]=os.clock()+30;return true
+    end
+    return false
+end
 local function choose_spawn()
     if state.historical then
         if not Scenarios then state.reason="Historische module niet beschikbaar";return nil end
@@ -1651,7 +1742,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
-        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false
+        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={}
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
@@ -1723,6 +1814,7 @@ local function state_event(kind,payload,extra)
             if previous and elapsed>=0.1 and elapsed<=5 then
                 local rate=math.max(0,entry.tiles-previous.tiles)/elapsed
                 state.territoryGrowth[id]=(state.territoryGrowth[id] or rate)*0.65+rate*0.35
+                if id==state.id then state.homeLossRate=(state.homeLossRate or 0)*0.65+math.max(0,previous.tiles-entry.tiles)/elapsed*0.35 end
             end
             local progress=state.frontProgress[id] or {at=os.clock(),tiles=entry.tiles}
             if previous and entry.tiles<previous.tiles then progress.at=os.clock() end
@@ -1915,7 +2007,7 @@ local function run_step()
     if not defending and (state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100)) then state.reason="Wachten op server na order";return end
     local targets=enemy_targets()
     if #state.incoming>0 then
-        state.reason="VERDEDIGEN: nieuwe aanvallen en frontversterkingen gepauzeerd"
+        state.reason="VERDEDIGEN: druk en beschikbare thuisreserve beoordelen"
         if defending and Strategy.try_buy_reinforcements() then return end
         if Strategy.try_nuke() then return end
         if Strategy.try_build(true) then return end
@@ -1924,20 +2016,23 @@ local function run_step()
             for _,attack in ipairs(state.incoming) do
                 if targets[attack.id] and (not worst or attack.troops>worst.troops) then worst=attack end
             end
-            local defenseRatio=worst and Strategy.defense_ratio(worst.id)
+            local defenseRatio=worst and os.clock()-(state.defenseCounterAt or -10000)>=6 and Strategy.defense_ratio(worst.id)
             if worst and defenseRatio then
-                if send({t="attack",tile=targets[worst.id],ratio=defenseRatio},"tegenaanval op "..worst.id) then state.lastSend=os.clock() end
+                if send({t="attack",tile=targets[worst.id],ratio=defenseRatio},"tegenaanval op "..worst.id) then state.lastSend=os.clock();state.defenseCounterAt=os.clock() end
                 return
             else state.reason="Aanval binnenkomend; geen veilige tegenaanval beschikbaar" end
         else state.reason="Aanval binnenkomend; offensief gepauzeerd" 
         end
-        state.reason="VERDEDIGEN: thuisleger behouden; wachten op groei of beschikbare verdediging"
+        if defending and Strategy.defense_harvest(targets) then return end
+        local hold,critical=Strategy.defense_budget()
+        state.reason="VERDEDIGEN: "..(critical and "zware druk; noodreserve behouden" or "druk beheersbaar; geen betaalbare extra order").." | thuisreserve "..math.ceil(hold)
         return
     end
     local mapGeneration=state.generation
     Strategy.water_targets()
     if mapGeneration~=state.generation or not state.ready or not fresh() or #state.incoming>0 then return end
     if Strategy.try_buy_reinforcements() then return end
+    if Strategy.try_shield() then return end
     local ratio=choose_ratio(false)
     state.planBorders={}
     for id,contact in pairs(Strategy.contacts()) do state.planBorders[id]=contact.border end
