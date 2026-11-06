@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="5.4-capacity-decisions"
+local VERSION="5.5-open-land-race"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -354,7 +354,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=5.4")
+]=],snapshot,RAW_URL.."?v=5.5")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1571,6 +1571,30 @@ local function choose_ratio(defending,economic)
     end
     return best
 end
+function Strategy.open_rival()
+    if not options.protect or #state.incoming>0 then return nil end
+    local open=false
+    for tile in pairs(state.frontier) do if buffer.readu8(state.owners,tile)==0 then open=true;break end end
+    if not open then return nil end
+    local rival=nil
+    for id in pairs(Strategy.contacts()) do
+        local enemy=state.players[id]
+        if enemy and enemy.alive and enemy.isBot~=true then
+            if rival then return nil end
+            rival=enemy
+        end
+    end
+    return rival
+end
+function Strategy.open_ready(ratio,hold)
+    if not ratio then return false end
+    local me=state.players[state.id]
+    if Strategy.open_rival() and me and ratio<=0.25 and me.troops-math.floor(me.troops*ratio)>=(hold or math.huge) then
+        state.economicStatus="Open-landrace: kleine preset; thuisleger op peil bij enige menselijke buur"
+        return true
+    end
+    return Strategy.growth_ready(ratio)
+end
 function Strategy.neutral_ratio(existing,fallback,fallbackReserve)
     local speeds=Config.TERRAIN_SPEED
     if type(speeds)~="table" or type(speeds[1])~="number" or type(Config.NEUTRAL_TILE_NUM)~="number"
@@ -1580,6 +1604,8 @@ function Strategy.neutral_ratio(existing,fallback,fallbackReserve)
     local desired=math.ceil(Config.NEUTRAL_TILE_NUM*math.max(10,speeds[1])/Config.NEUTRAL_TILE_MIN*1.25)
     desired=math.max(Config.MIN_ATTACK_TROOPS or 250,desired)
     local hold=Strategy.capacity(me)*math.min(options.reserve,options.growthFloor)/100
+    local rival=Strategy.open_rival()
+    if rival then hold=math.max(Strategy.capacity(me)*0.15,rival.troops*0.85) end
     if options.protect then hold=math.max(hold,Strategy.risk_reserve()) end
     if existing>=desired*0.85 then return nil,hold,desired end
     local needed=desired-existing
@@ -2258,7 +2284,7 @@ local function run_step_inner()
     state.requiredReserve=normalReserve
     local economicReady=Strategy.growth_ready(economicRatio)
     local openRatio,openReserve=Strategy.neutral_ratio(0,economicRatio,economicReserve)
-    local openReady=Strategy.growth_ready(openRatio)
+    local openReady=Strategy.open_ready(openRatio,openReserve)
     local active=Strategy.active_orders()
     local allowedFronts=state.transportKnown==false and 1 or options.maxFronts
     local serverSlots=Config.MAX_FRONTS_PER_PLAYER or 4
@@ -2292,7 +2318,7 @@ local function run_step_inner()
         if targets[0] and not busy[0] and options.expand and openRatio and openReady
             and (not weakest or (selectedEnemy and selectedEnemy.isBot~=true and selectedEnemy.troops>me.troops*0.20)) then
             local open=Strategy.open_tile()
-            if open and send({t="attack",tile=open,ratio=openRatio},"PLAN GROEI: passend open-landleger; thuisreserve "..math.ceil(openReserve or 0)) then state.lastSend=os.clock() end
+            if open and send({t="attack",tile=open,ratio=openRatio},"PLAN GROEI: "..(Strategy.open_rival() and "kleine uitbreidingspuls naast enige buur" or "passend open-landleger").."; thuisreserve "..math.ceil(openReserve or 0)) then state.lastSend=os.clock() end
             return
         end
         if not weakest and attacksAllowed then
