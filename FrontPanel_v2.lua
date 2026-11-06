@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="4.5-strategic-nukes"
+local VERSION="4.6-conquest-value"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -247,7 +247,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Rivieren en zee oversteken","rivers")
  toggle("Oorlog","Anti-nuke bij steden","sams")
  toggle("Oorlog","Botlanden met steden eerst","botCities")
- toggle("Oorlog","Zwakke botsteden heel houden","preserveBotCities")
+ toggle("Oorlog","Huizen van zwakke landen heel houden","preserveBotCities")
  toggle("Oorlog","Groeicurve benutten","growthAware")
  toggle("Oorlog","Lopende fronten versterken","reinforce")
  toggle("Oorlog","Reinforcement met goud kopen","buyReinforcements")
@@ -352,7 +352,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=4.5")
+]=],snapshot,RAW_URL.."?v=4.6")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -821,12 +821,12 @@ function Strategy.target_score(id,tile,distance)
     if not options.attack and not (options.expand and enemy.isBot==true) then return nil end
     if me.troops<enemy.troops*options.strength then return nil end
     local cities,value,complete=Strategy.city_value(id)
-    local priority=enemy.isBot==true and 2 or 1
-    if enemy.isBot==true and options.botCities and cities>0 then priority=4 end
-    local exposed=enemy.isBot~=true and enemy.troops<=me.troops*0.12
-    if exposed then priority=3.5 end
-    return priority*100000+math.min(value,100)*100+math.min(complete,30)*50
-        -enemy.troops/math.max(1,me.troops)*200-Strategy.nearby_danger(tile)*50-(distance or 0)*4
+    local cityWeight=enemy.isBot==true and not options.botCities and 0.5 or 1
+    local assets=(value*2000+complete*3000+cities*1000)*cityWeight
+    local land=math.sqrt(math.max(0,enemy.tiles or 0))*100
+    local cost=1+enemy.troops/math.max(1,me.troops)*8
+    local reward=(2000+assets+land)/cost
+    return reward-Strategy.nearby_danger(tile)*50-(distance or 0)*4
         +math.min(200,(state.planBorders and state.planBorders[id]) or 0)*2,
         cities,enemy.isBot==true
 end
@@ -1119,8 +1119,11 @@ function Strategy.cluster_candidate(strategic)
     end
     for _,s in pairs(state.structures) do
         local enemy=state.players[s.ownerId]
-        local captureInstead=options.preserveBotCities and enemy and enemy.isBot==true and me
-            and me.troops>=enemy.troops*options.strength and not attackers[s.ownerId]
+        local easyHuman=enemy and enemy.isBot~=true and me and me.troops>=enemy.troops*8
+            and Strategy.opportunity_ratio(s.ownerId,false)~=nil
+        local captureInstead=options.preserveBotCities and enemy and me
+            and ((enemy.isBot==true and me.troops>=enemy.troops*options.strength) or easyHuman)
+            and ((enemy.isBot==true and not attackers[s.ownerId]) or (enemy.isBot~=true and (attackers[s.ownerId] or 0)<=me.troops*0.05))
         if s.kind==1 and not s.uc and atWar[s.ownerId] and not friendly(s.ownerId) and not captureInstead then
             if buffer.readu8(state.owners,s.tile)==s.ownerId then table.insert(cities,s) end
             if #cities>=48 then break end
@@ -1450,7 +1453,15 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         for id,tile in pairs(targets) do
             local other=state.players[id]
             if not busy[id] and other and other.isBot==true and Strategy.city_value(id)>0
-                and economicRatio and economicReady and Strategy.target_score(id,tile,0) then return false end
+                and economicRatio and economicReady and Strategy.target_score(id,tile,0) then
+                local score=Strategy.target_score(id,tile,0)
+                local deployedValue=0
+                for _,front in ipairs(state.outgoing) do
+                    local current=Strategy.target_score(front.id,targets[front.id] or tile,0)
+                    deployedValue=math.max(deployedValue,current or 0)
+                end
+                if score>deployedValue then return false end
+            end
         end
     end
     state.boosts=state.boosts or {}
@@ -1920,6 +1931,7 @@ local function run_step()
     local freeExpansion=options.expand and targets[0]~=nil and choose_ratio(false,true)~=nil
     local cheapCapture=false
     local botHarvest=false
+    local treasureCapture=false
     if options.attack or options.expand then
         local occupied={}
         for _,front in ipairs(state.outgoing) do occupied[front.id]=true end
@@ -1928,7 +1940,8 @@ local function run_step()
             if id~=0 and not occupied[id] and enemy and (options.attack or enemy.isBot==true)
                 and enemy.troops<=me.troops*0.20 and Strategy.opportunity_ratio(id,state.targetProtected[id]) then
                 cheapCapture=true
-                if enemy.isBot==true then botHarvest=true end
+                if enemy.isBot==true then botHarvest=true
+                elseif Strategy.city_value(id)>=3 then treasureCapture=true end
             end
         end
     end
@@ -1937,7 +1950,8 @@ local function run_step()
     state.requiredReserve=reserveBeforePlanning
     local harvestPriority=botHarvest and ((state.cityCost and state.gold and state.gold<state.cityCost) or me.troops<Strategy.capacity(me)*0.65)
         and Strategy.active_orders()<math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
-    if not parallelOpportunity and not growthPriority and not harvestPriority and Strategy.try_build(false) then return end
+    local treasurePriority=treasureCapture and Strategy.active_orders()<math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
+    if not parallelOpportunity and not growthPriority and not harvestPriority and not treasurePriority and Strategy.try_build(false) then return end
     local normalReserve=state.requiredReserve
     local economicRatio=choose_ratio(false,true)
     local economicReserve=state.requiredReserve
@@ -2016,7 +2030,7 @@ local function run_step()
             state.reason="Plan: "..(bot and "botland oogsten: land, gebouwen en serverbeloning" or (active>0 and "parallel zwak buurland innemen" or "zwakke buur en huizen innemen"))
             log(state.reason.." | doel "..weakest.." | lopende fronten "..active)
             state.requiredReserve=math.ceil(bestReserve or normalReserve or 0)
-            description=description.." | inzet "..math.floor(me.troops*bestRatio).." | thuis "..math.floor(me.troops*(1-bestRatio))
+            description=description.." | huizen "..cityCount.." | waarde "..math.floor(bestScore).." | inzet "..math.floor(me.troops*bestRatio).." | thuis "..math.floor(me.troops*(1-bestRatio))
             if send({t="attack",tile=targets[weakest],ratio=bestRatio},description) then state.lastSend=os.clock() end
             return
         end
