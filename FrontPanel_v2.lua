@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="5.6-catch-up-strategy"
+local VERSION="5.7-border-diagnostics"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -355,7 +355,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=5.6")
+]=],snapshot,RAW_URL.."?v=5.7")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1866,7 +1866,8 @@ function Strategy.defense_harvest(targets,valuableOnly)
     local best,bestRatio,bestScore=nil,nil,-math.huge
     for id,tile in pairs(candidates) do
         local enemy=state.players[id]
-        local valuable=enemy and enemy.isBot~=true and options.attack and Strategy.city_value(id)>=3
+        local valuable=enemy and enemy.isBot~=true and options.attack
+            and (Strategy.city_value(id)>=1 or (enemy.tiles or 0)>=me.tiles*0.15)
         if enemy and ((enemy.isBot==true and (options.attack or options.expand) and not valuableOnly) or valuable)
             and not busy[id] and enemy.troops<=me.troops*0.10 then
             local score=Strategy.target_score(id,tile,0)
@@ -1966,7 +1967,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
-        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false
+        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false;state.lastBorderAudit=-10000;state.lastTargetReport=-10000
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
@@ -2135,6 +2136,46 @@ local function state_event(kind,payload,extra)
         end
     end
 end
+function Strategy.audit_border()
+    if not state.ready or os.clock()-(state.lastBorderAudit or -10000)<10 then return end
+    state.lastBorderAudit=os.clock()
+    local changed=false
+    local function inspect(tile)
+        local before=state.frontier[tile]
+        refresh_tile(tile)
+        if state.frontier[tile]~=before then changed=true end
+    end
+    for _,tile in pairs(state.ownedSamples or {}) do
+        if tile>=0 and tile<N and buffer.readu8(state.owners,tile)==state.id then inspect(tile);neighbours(tile,inspect) end
+    end
+    if changed then state.mapRevision=(state.mapRevision or 0)+1;log("GRENSCONTROLE: aangrenzende doelvelden opnieuw bijgewerkt") end
+end
+function Strategy.target_diagnostics()
+    local me=state.players[state.id]
+    if not state.ready or not me or not me.alive or os.clock()-(state.lastTargetReport or -10000)<20 then return end
+    state.lastTargetReport=os.clock()
+    local busy={}
+    for _,front in ipairs(state.outgoing) do busy[front.id]=true end
+    local printed=0
+    for id,contact in pairs(Strategy.contacts()) do
+        local enemy=state.players[id]
+        if enemy and enemy.troops<=me.troops*0.15 and printed<4 then
+            local why
+            if not options.attack and enemy.isBot~=true then why="Aanvallen staat UIT"
+            elseif busy[id] then why="Veldleger vecht al tegen dit land"
+            elseif #state.incoming>0 then
+                local hold,critical=Strategy.defense_budget()
+                why=critical and "Zware inkomende aanval" or ("Verdedigingsbudget thuis "..math.ceil(hold))
+            elseif Strategy.active_orders()>=(state.planFrontLimit or options.maxFronts) then why="Actieve fronten/transporten vullen limiet"
+            else
+                local ratio,hold=Strategy.opportunity_ratio(id,state.targetProtected and state.targetProtected[id])
+                why=ratio and ("Aanval haalbaar: "..math.floor(ratio*100).."%; selectie op waarde/tempo") or ("Troepenpreset of reserve blokkeert; reserve "..tostring(hold or "overige voorwaarden"))
+            end
+            log("DOEL "..id.." | vijand "..math.floor(enemy.troops).." | eigen "..math.floor(me.troops).." | "..why)
+            printed+=1
+        end
+    end
+end
 local function run_step_inner()
     local role=RS:GetAttribute(Matchmaker.ROLE_ATTR)
     if role=="match" and (not state.id or state.id==0) and os.clock()-(state.helloAt or -100)>8 then
@@ -2230,6 +2271,7 @@ local function run_step_inner()
     Strategy.update_catchup()
     local defending=options.defend and #state.incoming>0
     if not defending and (state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100)) then state.reason="Wachten op server na order";return end
+    Strategy.audit_border()
     local targets=enemy_targets()
     if #state.incoming>0 then
         state.reason="VERDEDIGEN: druk en beschikbare thuisreserve beoordelen"
@@ -2423,6 +2465,7 @@ local function run_step()
     local before=state.orderSerial or 0
     local ok,result=xpcall(function()
         run_step_inner()
+        if state.phase=="playing" then Strategy.target_diagnostics() end
         if (state.orderSerial or 0)==before and Strategy.interleave_ready("build") then
             if #state.incoming>0 then Strategy.try_build(true)
             elseif not Strategy.try_shield() then Strategy.try_build(false) end
