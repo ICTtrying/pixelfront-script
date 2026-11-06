@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.4-message-types"
+local VERSION="3.5-growth-and-reinforcement"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -17,7 +17,8 @@ local options={queue=false,spawn=false,expand=false,attack=false,defend=false,le
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
  protect=true,cities=true,posts=true,nukes=false,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
- rivers=true,sams=true,maxFronts=3,riverRange=24,maxSams=4,botCities=true,preserveBotCities=true}
+ rivers=true,sams=true,maxFronts=3,riverRange=24,maxSams=4,botCities=true,preserveBotCities=true,
+ growthAware=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
 if type(getgenv)=="function" then
@@ -33,7 +34,8 @@ local function valid_settings(value)
  end
  for key,range in pairs({reserve={10,90},strength={1.2,10},interval={2,30},
   goldReserve={0,10000000},minCluster={2,12},nukeDelay={30,300},maxCities={1,40},
-  maxCityLevel={1,10},buildDelay={5,60},maxFronts={1,4},riverRange={4,48},maxSams={1,12}}) do
+  maxCityLevel={1,10},buildDelay={5,60},maxFronts={1,4},riverRange={4,48},maxSams={1,12},
+  growthFloor={15,60},reinforceDelay={4,30},maxBoosts={1,5}}) do
   local n=value[key]
   if type(n)=="number" and n==n and n>=range[1] and n<=range[2] then options[key]=n end
  end
@@ -143,10 +145,10 @@ local function refresh_toggles()
   item.button.Text=item.name..": "..(options[key] and "AAN" or "UIT")
   item.button.BackgroundColor3=options[key] and Color3.fromRGB(30,125,80) or Color3.fromRGB(35,80,145)
  end
- title.Text="FRONT PANEL 3.4 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
+ title.Text="FRONT PANEL 3.5 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
 local function halt(reason)
- for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams"}) do options[key]=false end
+ for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams","reinforce"}) do options[key]=false end
  refresh_toggles()
  save_settings()
  state.reason=reason or "Gestopt"
@@ -230,7 +232,7 @@ local ui_ok,ui_error=xpcall(function()
   local name_copy=name
   simple_button(name,5,44+(i-1)*40,100,35,panel).Activated:Connect(function() select_tab(name_copy) end)
  end
- status=label("Overzicht","Spelverbinding wordt geladen...",320)
+ status=label("Overzicht","Spelverbinding wordt geladen...",400)
  label("Overzicht","Zet de gewenste functies aan. ACTIEF voert orders uit. OBSERVATIE toont alleen plannen. Instellingen worden automatisch opgeslagen wanneer je executor dit ondersteunt.",100)
  toggle("Match","Auto join","queue"); toggle("Match","Auto spawn","spawn"); toggle("Match","Verlaat na einde","leave")
  toggle("Match","Herladen na teleport","reload")
@@ -245,6 +247,8 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Anti-nuke bij steden","sams")
  toggle("Oorlog","Botlanden met steden eerst","botCities")
  toggle("Oorlog","Zwakke botsteden heel houden","preserveBotCities")
+ toggle("Oorlog","Groeicurve benutten","growthAware")
+ toggle("Oorlog","Lopende fronten versterken","reinforce")
  label("Oorlog","Nukes: alleen atoomwapens, alleen tegen een actief front, met meerdere steden binnen de zekere binnenradius. Geen eigen of geallieerde grond binnen de buitenradius. Beschikbare tokens en goud bepalen of een order mogelijk is.",160)
  toggle("Instellen","Observatiemodus","dry")
  button("Instellen","Echte acties aanzetten",function()
@@ -263,6 +267,9 @@ local ui_ok,ui_error=xpcall(function()
  number_input("Instellen","Maximale actieve fronten incl. transport","maxFronts",1,4)
  number_input("Instellen","Maximale waterzoekafstand in tegels","riverRange",4,48)
  number_input("Instellen","Maximale anti-nuketorens","maxSams",1,12)
+ number_input("Instellen","Rustige uitbreiding: minimale reserve %","growthFloor",15,60)
+ number_input("Instellen","Seconden tussen versterkingen per doel","reinforceDelay",4,30)
+ number_input("Instellen","Extra orders zonder terreinwinst per doel","maxBoosts",1,5)
  button("Foutlog","Kopieer foutlog",function()
   if type(setclipboard)=="function" then setclipboard(table.concat(history,"\n"))
   else log("Geen klembordfunctie; maak een screenshot.") end
@@ -342,7 +349,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.4")
+]=],snapshot,RAW_URL.."?v=3.5")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -363,6 +370,7 @@ local message_decoders={
     structs={"unpackStructs","unpackStructures","unpackStructEvents","unpackStructureEvents","decodeStructures"},
     players={"unpackPlayers","decodePlayers"},
     vehicles={"unpackVehicles","decodeVehicles"},
+    armies={"unpackArmies","decodeArmies"},
     allies={"unpackAllies","unpackIds","unpackIdList"},
     frontList={"unpackFrontList","unpackAttacks","unpackFronts"},
     fronts={"unpackFronts","decodeFronts"},
@@ -390,6 +398,9 @@ local function valid_list(kind,list)
             if type(entry.id)~="number" or type(entry.troops)~="number" or type(entry.tiles)~="number" or type(entry.alive)~="boolean" then return false end
         elseif kind=="vehicles" then
             if type(entry.owner)~="number" or type(entry.kind)~="number" then return false end
+        elseif kind=="armies" then
+            if type(entry.id)~="number" or type(entry.t)~="number" or type(entry.troops)~="number"
+                or type(entry.x)~="number" or type(entry.y)~="number" then return false end
         elseif kind=="frontList" then
             if type(entry.id)~="number" or type(entry.troops)~="number" then return false end
         end
@@ -431,6 +442,7 @@ local function message_issue(kind,payload,critical)
         state.structuresReady=false
         if changed then log("Gebouwafhankelijke orders wachten op betrouwbare gebouwgegevens.") end
     elseif kind=="vehicles" then state.transportKnown=false end
+    if kind=="armies" then state.armies=nil end
 end
 local function message_list(kind,payload,critical)
     local list=message_table(kind,payload)
@@ -536,7 +548,9 @@ local function apply_delta(data)
     local touched={}
     for i=1,#changes,2 do
         local tile,owner=changes[i],changes[i+1]
+        local previous=buffer.readu8(state.owners,tile)
         buffer.writeu8(state.owners,tile,owner)
+        if owner==state.id and previous~=state.id then state.lastCaptureAt=os.clock() end
         if state.structures and state.structures[tile] then state.cityCache=nil end
         if owner==state.id then Strategy.sample_owned(tile) end
         touched[tile]=true
@@ -929,6 +943,10 @@ local function send(payload,description)
     if options.dry then state.reason="Observatie: "..description;log("PLAN: "..description); return false end
     folder.Intent:FireServer(payload)
     state.lastCommand=payload
+    if payload.t=="attack" and state.owners and state.frontier[payload.tile] then
+        state.landOrders=state.landOrders or {}
+        state.landOrders[buffer.readu8(state.owners,payload.tile)]={tile=payload.tile,at=os.clock()}
+    end
     state.reason="Order verstuurd: "..description
     log("ORDER: "..description)
     return true
@@ -994,22 +1012,69 @@ function Strategy.try_build(defensive)
     end
     return true
 end
-local function choose_ratio(defending)
+function Strategy.capacity(me)
+    return math.max(1,(Config.MAX_TROOPS_MULT or 1)*(
+        me.tiles^Config.TROOPS_TILE_EXPONENT*Config.TROOPS_PER_TILE_COEF+Config.BASE_MAX_TROOPS
+    )+(state.levels or 0)*Config.CITY_TROOP_INCREASE+(state.capBonus or 0))
+end
+function Strategy.growth_model(troops,cap)
+    return ((Config.GROWTH_BASE or 10)+math.max(0,troops)^(Config.GROWTH_EXPONENT or 0.73)/(Config.GROWTH_DIVISOR or 4))
+        *math.max(0,1-troops/cap)
+end
+function Strategy.growth_peak(cap)
+    if state.growthProfile and math.abs(state.growthProfile.cap-cap)/cap<0.01 then return state.growthProfile.fraction end
+    local best,bestGain=0.4,-1
+    for step=5,95 do
+        local fraction=step/100
+        local gain=Strategy.growth_model(cap*fraction,cap)
+        if gain>bestGain then best,bestGain=fraction,gain end
+    end
+    state.growthProfile={cap=cap,fraction=best}
+    return best
+end
+function Strategy.growth_ready(ratio)
+    if not ratio then return false end
+    if not options.growthAware then return true end
+    local me=state.players[state.id]
+    if not me then return false end
+    local cap=Strategy.capacity(me)
+    local peak=Strategy.growth_peak(cap)
+    local trigger=math.clamp(peak/math.max(0.01,1-ratio)-0.04,0.45,0.75)
+    state.economicStatus=string.format("%.0f%% gevuld; groeipiekmodel %.0f%%; ordervenster vanaf %.0f%%",me.troops/cap*100,peak*100,trigger*100)
+    return me.troops/cap>=trigger
+end
+function Strategy.observe_growth(previous,current)
+    if not previous or not current then return end
+    local dt=os.clock()-(state.lastPlayers or 0)
+    local delta=current.troops-previous.troops
+    if dt<0.1 or dt>3 or delta<0 or os.clock()-(state.lastSend or -100)<math.max(1,options.interval) then return end
+    if #state.incoming>0 then return end
+    local oldCap,newCap=Strategy.capacity(previous),Strategy.capacity(current)
+    if math.abs(newCap-oldCap)/oldCap>0.01 then return end
+    local rate=delta/dt
+    local estimate=Strategy.growth_model(current.troops,newCap)*(Config.TICK_RATE or 10)
+    if rate>math.max(50,estimate*5) then return end
+    state.measuredGrowth=state.measuredGrowth and state.measuredGrowth*0.7+rate*0.3 or rate
+end
+local function choose_ratio(defending,economic)
     local me=state.players[state.id]
     if not me or not me.alive or me.troops<=0 then return nil end
-    local cap=(Config.MAX_TROOPS_MULT or 1)*(
-        me.tiles^Config.TROOPS_TILE_EXPONENT*Config.TROOPS_PER_TILE_COEF+Config.BASE_MAX_TROOPS
-    )+(state.levels or 0)*Config.CITY_TROOP_INCREASE+(state.capBonus or 0)
-    local required=cap*options.reserve/100
+    local cap=Strategy.capacity(me)
+    local reserve=options.reserve
+    if economic and options.growthAware and not defending then reserve=math.min(reserve,options.growthFloor) end
+    local required=cap*reserve/100
     state.baseReserve=required
     local risk=Strategy.risk_reserve()
     if options.protect and not defending then required=math.max(required,risk) end
     state.requiredReserve=math.ceil(required)
-    local best=nil
+    local best,bestGain=nil,-math.huge
     for _,ratio in ipairs(Config.attackPresets(state.mode)) do
         local committed=math.floor(me.troops*ratio)
         if committed>=(Config.MIN_ATTACK_TROOPS or 250) and me.troops-committed>=required then
-            if not best or ratio<best then best=ratio end
+            if economic and options.growthAware then
+                local gain=Strategy.growth_model(me.troops-committed,cap)
+                if gain>bestGain then best,bestGain=ratio,gain end
+            elseif not best or ratio<best then best=ratio end
         end
     end
     return best
@@ -1035,6 +1100,74 @@ local function enemy_targets()
         end
     end
     return result
+end
+function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
+    if not options.reinforce or #state.outgoing==0 then return false end
+    local me=state.players[state.id]
+    local now=os.clock()
+    local busy={}
+    for _,front in ipairs(state.outgoing) do busy[front.id]=true end
+    local slots=math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
+    if Strategy.active_orders()<slots then
+        for id,tile in pairs(targets) do
+            local other=state.players[id]
+            if not busy[id] and other and other.isBot==true and Strategy.city_value(id)>0
+                and economicRatio and economicReady and Strategy.target_score(id,tile,0) then return false end
+        end
+    end
+    state.boosts=state.boosts or {}
+    local best=nil
+    for _,front in ipairs(state.outgoing) do
+        local id=front.id
+        local enemy=state.players[id]
+        local economic=id==0 or (enemy and enemy.isBot==true)
+        local enabled=(id==0 and options.expand) or (id~=0 and (options.attack or (economic and options.expand)))
+        local ratio=economic and economicRatio or normalRatio
+        local tile=targets[id]
+        if id==0 then
+            tile=nil
+            local anchor=nil
+            for _,army in ipairs(state.armies or {}) do
+                if army.id==state.id and army.t==0 then
+                    local x,y=math.floor(army.x),math.floor(army.y)
+                    if x>=0 and x<W and y>=0 and y<H then anchor=y*W+x;break end
+                end
+            end
+            local last=state.landOrders and state.landOrders[0]
+            if not anchor and last and now-last.at<30 then anchor=last.tile end
+            if anchor then
+                local closest=65
+                for candidate in pairs(state.frontier) do
+                    if buffer.readu8(state.owners,candidate)==0 then
+                        local d=Strategy.distance(anchor,candidate)
+                        if d<closest then closest=d;tile=candidate end
+                    end
+                end
+            end
+        end
+        local record=state.boosts[id] or {at=-10000,bursts=0,captureAt=-10000}
+        if (state.lastCaptureAt or -10000)>record.captureAt then record.bursts=0 end
+        local eligible=id==0 or Strategy.target_score(id,tile or 0,0)~=nil
+        if enabled and ratio and tile and eligible and not friendly(id)
+            and (not options.protect or not state.targetProtected[id])
+            and now-record.at>=options.reinforceDelay and record.bursts<options.maxBoosts then
+            local committed=math.floor(me.troops*ratio)
+            local depleted=front.troops<committed*0.5
+            local ready=not economic or economicReady or depleted
+            local oversupplied=front.troops>committed*2 and me.troops/Strategy.capacity(me)<0.9
+            if ready and not oversupplied then
+                local score=(depleted and 1000 or 0)+(id~=0 and 100 or 0)-front.troops/math.max(1,committed)
+                if not best or score>best.score then best={id=id,tile=tile,ratio=ratio,record=record,score=score} end
+            end
+        end
+    end
+    if not best then return false end
+    if send({t="attack",tile=best.tile,ratio=best.ratio},"bestaand front "..best.id.." gericht versterken") then
+        best.record.at=now;best.record.bursts=best.record.bursts+1
+        best.record.captureAt=state.lastCaptureAt or -10000
+        state.boosts[best.id]=best.record;state.lastSend=now
+    end
+    return true
 end
 local function choose_spawn()
     if state.historical then
@@ -1087,7 +1220,7 @@ local function choose_spawn()
     return best
 end
 local function state_event(kind,payload,extra)
-    if kind=="roster" or kind=="structs" or kind=="players" or kind=="vehicles" then
+    if kind=="roster" or kind=="structs" or kind=="players" or kind=="vehicles" or kind=="armies" then
         local list=message_list(kind,payload,kind=="players")
         if not list then return end
         payload=list
@@ -1119,6 +1252,7 @@ local function state_event(kind,payload,extra)
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
         state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil
         state.ownedSamples={};state.structures={};state.structuresReady=false
+        state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
         state.blockedBuild={};state.plannedBlasts={};state.gold=nil;state.cityCost=nil;state.postCost=nil
         state.freeCities=0;state.freePosts=0;state.freeNukes=0;state.freeSams=0;state.samCost=nil
@@ -1166,6 +1300,7 @@ local function state_event(kind,payload,extra)
     elseif kind=="players" and state.id then
         local players={}
         for _,entry in ipairs(payload) do players[entry.id]=entry end
+        Strategy.observe_growth(state.players[state.id],players[state.id])
         state.players=players; state.lastPlayers=os.clock()
     elseif kind=="fronts" and state.id then
         assert(type(payload.out)=="table" and type(payload.inc)=="table","Onbekend fronts-formaat")
@@ -1180,6 +1315,8 @@ local function state_event(kind,payload,extra)
         state.freeCities=payload.freeCities or 0;state.freePosts=payload.freePosts or 0;state.freeNukes=payload.freeNukes or 0
         state.allies={}
         for _,id in ipairs(payload.diplo and payload.diplo.allies or {}) do state.allies[id]=true end
+    elseif kind=="armies" and state.id then
+        state.armies=payload
     elseif kind=="vehicles" and state.id then
         state.transportCount=0
         state.transportKnown=true
@@ -1251,16 +1388,19 @@ local function run_step()
     local warnings={}
     for kind in pairs(state.protocolWarnings or {}) do warnings[#warnings+1]=kind end
     table.sort(warnings)
-    status.Text=string.format("Server: %s | %s\nKaart: %s | Troepen: %s\nInkomend: %d | Uitgaand: %d\nModus: %s\nOpslag: %s\nHerladen: %s\nSterkste buur: %s | Buren: %s\nReserve nodig: %s | Goud: %s\nBerichtwaarschuwingen: %s\nStatus: %s",
+    status.Text=string.format("Server: %s | %s\nKaart: %s | Troepen: %s\nInkomend: %d | Uitgaand: %d\nModus: %s\nOpslag: %s\nHerladen: %s\nSterkste buur: %s | Buren: %s\nReserve strijd/economie: %s | Goud: %s\nGroeimodel: %s\nGemeten groei: %s troepen/s\nBerichtwaarschuwingen: %s\nStatus: %s",
         tostring(role),tostring(state.phase),state.ready and "gereed" or "wachten",
         me and tostring(me.troops) or "onbekend",#state.incoming,#state.outgoing,
         options.dry and "OBSERVATIE: GEEN ORDERS" or "ACTIEF",storage_status,
         options.reload and (state.reloadStatus or "controleren") or "UIT",
         tostring(state.strongestNeighbour or "?"),tostring(state.neighbourCount or "?"),
-        tostring(state.requiredReserve or "?"),tostring(state.gold or "?"),
+        (tostring(state.requiredReserve or "?").." / "..tostring(state.economicReserve or "?")),tostring(state.gold or "?"),
+        state.economicStatus or "nog geen betrouwbare beoordeling",
+        state.measuredGrowth and string.format("%.1f",state.measuredGrowth) or "meten",
         #warnings>0 and table.concat(warnings,", ") or "geen",state.reason or "Initialiseren")
     if state.engineFault then
         state.reason="Gepauzeerd na fout; instellingen behouden. Gebruik Synchroniseer opnieuw."
+        status.Text=state.engineFault
         return
     end
     if state.protocolBlocks and next(state.protocolBlocks) then
@@ -1344,7 +1484,14 @@ local function run_step()
     end
     if Strategy.try_nuke() then return end
     if Strategy.try_build(false) then return end
-    if not ratio then state.reason="Troepen bewaren: reserve of sterke buurlanden vereisen meer verdediging";return end
+    local normalReserve=state.requiredReserve
+    local economicRatio=choose_ratio(false,true)
+    local economicReserve=state.requiredReserve
+    state.economicReserve=economicReserve
+    state.requiredReserve=normalReserve
+    local economicReady=Strategy.growth_ready(economicRatio)
+    if Strategy.try_reinforce(targets,ratio,economicRatio,economicReady) then return end
+    if not ratio and not economicRatio then state.reason="Troepen bewaren: reserve of sterke buurlanden vereisen meer verdediging";return end
     local active=Strategy.active_orders()
     local allowedFronts=state.transportKnown==false and 1 or options.maxFronts
     if active>=math.min(allowedFronts,Config.MAX_FRONTS_PER_PLAYER or 4) then
@@ -1352,36 +1499,42 @@ local function run_step()
     end
     local busy={}
     for _,front in ipairs(state.outgoing) do busy[front.id]=true end
-    if options.expand and targets[0] and not busy[0] then
+    if options.expand and targets[0] and not busy[0] and economicRatio and economicReady then
         local tile=Strategy.open_tile()
-        if tile and send({t="attack",tile=tile,ratio=ratio},"uitbreiden via minder bedreigde grens") then state.lastSend=os.clock() end
+        if tile and send({t="attack",tile=tile,ratio=economicRatio},"groeivenster benutten: uitbreiden via minder bedreigde grens") then state.lastSend=os.clock() end
         return
     end
     if options.attack or options.expand then
         local truce=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
         if os.clock()-(state.playingAt or 0)<truce then state.reason="Beginbescherming afwachten";return end
-        local weakest,bestScore=nil,-math.huge
+        local weakest,bestScore,bestRatio=nil,-math.huge,nil
         for id,tile in pairs(targets) do
             if id~=0 and not busy[id] and (not options.protect or not state.targetProtected[id]) then
+                local enemy=state.players[id]
+                local economic=enemy and enemy.isBot==true
+                local orderRatio=economic and economicRatio or ratio
                 local score=Strategy.target_score(id,tile,0)
-                if score and score>bestScore then weakest,bestScore=id,score end
+                if orderRatio and (not economic or economicReady) and score and score>bestScore then weakest,bestScore,bestRatio=id,score,orderRatio end
             end
         end
         if not weakest then state.reason="Geen nieuw veilig landfront; wateroversteek onderzoeken" end
         if options.rivers and state.transportKnown~=false and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
-            local targetId,target,waterScore=nil,nil,-math.huge
+            local targetId,target,waterScore,waterRatio,waterReserve=nil,nil,-math.huge,nil,nil
             for id,entry in pairs(state.waterTargets or {}) do
+                local enemy=state.players[id]
+                local economic=id==0 or (enemy and enemy.isBot==true)
+                local orderRatio=economic and economicRatio or ratio
                 local score=id==0 and options.expand and 0 or Strategy.target_score(id,entry.tile,entry.distance)
                 local pending=state.riverOrders[id]
-                if score and not targets[id] and not busy[id] and not friendly(id)
+                if orderRatio and (not economic or economicReady) and score and not targets[id] and not busy[id] and not friendly(id)
                     and (not pending or pending.untilTime<=os.clock()) then
-                    if score>waterScore then targetId,target,waterScore=id,entry,score end
+                    if score>waterScore then targetId,target,waterScore,waterRatio,waterReserve=id,entry,score,orderRatio,economic and economicReserve or normalReserve end
                 end
             end
             local boatTroops=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
             if target and waterScore>bestScore and boatTroops>=(Config.TRANSPORT_BOAT_MIN_TROOPS or 250)
-                and me.troops-boatTroops>=(state.requiredReserve or 0) then
-                if send({t="attack",tile=target.tile,ratio=ratio},"rivier/korte waterroute naar "..targetId.."; server kiest landbrug of transport") then
+                and me.troops-boatTroops>=(waterReserve or 0) then
+                if send({t="attack",tile=target.tile,ratio=waterRatio},"rivier/korte waterroute naar "..targetId.."; server kiest landbrug of transport") then
                     state.lastSend=os.clock()
                     state.riverOrders[targetId]={tile=target.tile,untilTime=os.clock()+60}
                 end
@@ -1393,9 +1546,10 @@ local function run_step()
             local cityCount=Strategy.city_value(weakest)
             local bot=state.players[weakest].isBot==true
             local description=bot and ("botland "..weakest.." veroveren; "..cityCount.." zichtbare steden") or "voorzichtige aanval op speler/onbekend land "..weakest
-            if send({t="attack",tile=targets[weakest],ratio=ratio},description) then state.lastSend=os.clock() end
+            if send({t="attack",tile=targets[weakest],ratio=bestRatio},description) then state.lastSend=os.clock() end
             return
         end
+        if options.growthAware and not economicReady then state.reason="Eerst groeien tot economisch ordervenster; gevaarlijke buren blijven meetellen" end
     else state.reason="Uitbreiden en aanvallen staan uit"
     end
 end
@@ -1426,7 +1580,13 @@ task.spawn(guard(function()
         local obj=folder:WaitForChild(name,10)
         assert(obj and obj:IsA("RemoteEvent"),"Remote ontbreekt: "..name)
     end
-    connect(folder.State.OnClientEvent,state_event)
+    connect(folder.State.OnClientEvent,function(kind,payload,extra)
+        local ok,err=xpcall(state_event,debug.traceback,kind,payload,extra)
+        if not ok then
+            state.engineFault="BERICHT="..tostring(kind).." | TYPE="..typeof(payload).."\n"..tostring(err)
+            state.ready=false;log(state.engineFault);status.Text=state.engineFault
+        end
+    end)
     connect(folder.Delta.OnClientEvent,function(data)
         if not state.id or state.awaitingInit then return end
         if state.snapshotReady then apply_delta(data)
