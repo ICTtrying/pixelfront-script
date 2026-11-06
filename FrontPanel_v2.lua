@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.0-match-recorder"
+local VERSION="6.1-parallel-campaigns"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -164,6 +164,7 @@ function Recorder.export()
  end
  local body=complete and table.concat(chunks) or Recorder.memory_text()
  local metadata={schema=1,session=Recorder.session,kind="export_manifest",version=VERSION,
+  durationSeconds=os.clock()-Recorder.started,matchObserved=Recorder.matchObserved==true,lastPhase=state.phase,
   lastSequence=Recorder.seq,parts=Recorder.part,partLimitReached=Recorder.part>=Recorder.maxParts,
   memoryDropped=Recorder.dropped,source=complete and "disk_parts" or "recent_memory",
   firstRetainedMemorySequence=Recorder.seq-(Recorder.tail-Recorder.head),
@@ -173,7 +174,11 @@ function Recorder.export()
  local path=Recorder.prefix..(complete and "_export.jsonl" or "_recent.jsonl")
  if type(writefile)=="function" then
   local ok,err=pcall(writefile,path,text)
-  if ok then return path,(complete and Recorder.part<Recorder.maxParts) and "Opgeslagen" or "Gedeeltelijke tijdlijn; zie exportmetadata" end
+  if ok and complete and Recorder.matchObserved then
+   local saved,fault=pcall(writefile,"frontpanel_latest_match.jsonl",text)
+   if not saved then Recorder.error="Laatste wedstrijdkopie: "..tostring(fault) end
+  end
+  if ok then return path,not Recorder.matchObserved and "Opgeslagen; deze opname bevat nog geen wedstrijd" or ((complete and Recorder.part<Recorder.maxParts) and "Opgeslagen" or "Gedeeltelijke tijdlijn; zie exportmetadata") end
   Recorder.error=tostring(err)
  end
  if type(setclipboard)=="function" then
@@ -424,7 +429,7 @@ local ui_ok,ui_error=xpcall(function()
  number_input("Instellen","Seconden tussen versterkingen per doel","reinforceDelay",4,30)
  number_input("Instellen","Extra orders zonder terreinwinst per doel","maxBoosts",1,5)
  toggle("Data","Wedstrijd opnemen","recordData")
- label("Data","Automatisch: alle zichtbare spelers elke 2 seconden, fronten, gebouwen, orders, fouten en plannerredenen. Buffers krijgen een samenvatting. Opslag maximaal 32 MB per uitvoering; geheugen bewaart de recentste 2 MB.",125)
+ label("Data","Automatisch: alle zichtbare spelers elke 2 seconden, fronten, gebouwen, orders, fouten en plannerredenen. Buffers krijgen een samenvatting. Opnamedelen maximaal 32 MB per uitvoering; exports komen erbij. Geheugen bewaart de recentste 2 MB.",125)
  button("Data","Exporteer wedstrijddata",function()
   local path,message=Recorder.export()
   log(message..(path and (": "..path) or ""))
@@ -434,7 +439,7 @@ local ui_ok,ui_error=xpcall(function()
   Recorder.emit("manual_marker",{reason=state.reason,phase=state.phase})
   Recorder.flush(true);log("Moment gemarkeerd in de wedstrijddata.")
  end)
- Recorder.exportStatus=label("Data","Na de wedstrijd: Exporteer wedstrijddata. Stuur het export.jsonl-bestand uit de werkmap van je executor mee. Bij een teleport blijft het vorige bestand apart bewaard.",110)
+ Recorder.exportStatus=label("Data","Na de wedstrijd: Exporteer wedstrijddata. Stuur frontpanel_latest_match.jsonl uit de werkmap van je executor. Een lobby-export vervangt je laatste wedstrijd niet.",110)
  button("Data","Kopieer recente data",function()
   if type(setclipboard)=="function" then
    local ok=pcall(setclipboard,Recorder.memory_text())
@@ -508,6 +513,12 @@ local function setup_reload()
  connect(player.OnTeleport,function(teleport_state)
   Recorder.emit("teleport",{state=tostring(teleport_state)})
   Recorder.flush(true)
+  if teleport_state==Enum.TeleportState.Started and not Recorder.teleportExported then
+   Recorder.teleportExported=true
+   local path,message=Recorder.export()
+   log(message..(path and (": "..path) or ""))
+  end
+  if teleport_state==Enum.TeleportState.Failed then Recorder.teleportExported=false end
   if teleport_state==Enum.TeleportState.Failed then state.teleportQueued=false;return end
   if not options.reload or state.teleportQueued then return end
   if teleport_state~=Enum.TeleportState.Started and teleport_state~=Enum.TeleportState.InProgress then return end
@@ -528,7 +539,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.0")
+]=],snapshot,RAW_URL.."?v=6.1")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1565,6 +1576,7 @@ function Strategy.action_delay()
     local me=state.players[state.id]
     if not me or not me.alive or not state.ready then return options.interval end
     local fill=me.troops/Strategy.capacity(me)
+    if os.clock()-(state.campaignUrgencyAt or -100)<0.75 then return math.min(options.interval,0.75) end
     if state.catchupActive and fill>=0.40 then return math.min(options.interval,1) end
     local growth=state.territoryGrowth or {}
     local myRate=growth[state.id] or 0
@@ -1904,6 +1916,67 @@ local function enemy_targets()
     end
     return result
 end
+function Strategy.finish_strength(enemy)
+ local budgetNeed=enemy.troops*(Config.BUDGET_RATIO_MAX or 0.5)/math.max(0.001,2*(Config.SPEED_RATIO_DIV or 5))
+ local tileCostNeed=enemy.troops/math.max(0.001,(Config.SPEED_RATIO_DIV or 5)*(Config.SPEED_RATIO_MIN or 0.2))
+ return math.max(Config.MIN_ATTACK_TROOPS or 250,budgetNeed,tileCostNeed)*1.25
+end
+function Strategy.finish_ratio(id,field,stalled)
+ local me,enemy=state.players[state.id],state.players[id]
+ if not me or not enemy or me.troops<enemy.troops*8 then return nil end
+ local need=Strategy.finish_strength(enemy)
+ if field>=need and not stalled then return nil end
+ local allowed,reserve=Strategy.opportunity_ratio(id,state.targetProtected and state.targetProtected[id])
+ if not allowed then return nil end
+ local gap=math.max(Config.MIN_ATTACK_TROOPS or 250,need-field)
+ local best=nil
+ for _,preset in ipairs(Config.attackPresets(state.mode)) do
+  local sent=math.floor(me.troops*preset)
+  if preset<=0.50 and sent>=gap and me.troops-sent>=(reserve or 0) and (not best or preset<best) then best=preset end
+ end
+ return best,need,reserve
+end
+function Strategy.quick_campaign(targets)
+ if not options.attack or #state.outgoing==0 or #state.incoming>0 or not fresh() then return false end
+ local me=state.players[state.id]
+ if not me or not me.alive or not state.ready or state.transportKnown==false then return false end
+ if state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
+ local grace=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
+ if os.clock()-(state.playingAt or 0)<grace then return false end
+ local slots=math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
+ if options.protect and options.defend and (Config.MAX_FRONTS_PER_PLAYER or 4)>1 then
+  for id,contact in pairs(Strategy.contacts()) do
+   if state.players[id] and state.players[id].isBot~=true and contact.troops>=me.troops*0.60 then
+    slots=math.min(slots,(Config.MAX_FRONTS_PER_PLAYER or 4)-1);break
+   end
+  end
+ end
+ state.planFrontLimit=slots
+ if Strategy.active_orders()>=slots then return false end
+ local busy={}
+ for _,front in ipairs(state.outgoing) do busy[front.id]=true end
+ for id,pending in pairs(state.riverOrders or {}) do if pending.untilTime>os.clock() then busy[id]=true end end
+ local best=nil
+ for id,tile in pairs(targets) do
+  local enemy=state.players[id]
+  if id~=0 and not busy[id] and enemy and enemy.alive and enemy.troops<=me.troops*0.20 then
+   local ratio,reserve=Strategy.opportunity_ratio(id,state.targetProtected and state.targetProtected[id])
+   local score=ratio and Strategy.target_score(id,tile,0)
+   if score and (not best or score>best.score) then best={id=id,tile=tile,ratio=ratio,reserve=reserve,score=score} end
+  end
+ end
+ if not best then return false end
+ state.campaignUrgencyAt=os.clock()
+ if not Strategy.order_ready("attack") then state.campaignUrgencyAt=nil;return false end
+ if send({t="attack",tile=best.tile,ratio=best.ratio},"PARALLELLE CAMPAGNE: zwak land "..best.id.." | actieve fronten "..Strategy.active_orders().." | reserve "..math.ceil(best.reserve or 0)) then
+  state.lastSend=os.clock()
+  Recorder.emit("campaign_selection",best)
+  state.campaignUrgencyAt=nil
+  return true
+ end
+ state.campaignUrgencyAt=nil
+ return false
+end
 function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
     if not options.reinforce or #state.outgoing==0 then return false end
     local me=state.players[state.id]
@@ -1944,7 +2017,7 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         local progress=state.frontProgress and state.frontProgress[id]
         local stalled=enemy and progress and now-progress.at>=15
         local fastFinish=enemy and enemy.alive and me.troops>=enemy.troops*8
-        if fastFinish then ratio=Strategy.opportunity_ratio(id,state.targetProtected[id]) end
+        if fastFinish then ratio=Strategy.finish_ratio(id,front.troops,stalled) end
         if breakout then ratio=Strategy.breakout_ratio(id,state.targetProtected[id],true) end
         if id==0 then
             tile=nil
@@ -1968,7 +2041,9 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
             end
         end
         local record=state.boosts[id] or {at=-10000,bursts=0,captureAt=-10000}
-        if (state.lastCaptureAt or -10000)>record.captureAt then record.bursts=0 end
+        if id==0 then
+            if (state.lastCaptureAt or -10000)>record.captureAt then record.bursts=0 end
+        elseif enemy and record.tiles and enemy.tiles<record.tiles then record.bursts=0 end
         local eligible=id==0 or breakout or fastFinish or Strategy.target_score(id,tile or 0,0)~=nil
         if enabled and ratio and tile and eligible and not friendly(id)
             and (not options.protect or not state.targetProtected[id] or breakout or fastFinish)
@@ -1985,8 +2060,8 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
                 elseif not depleted then oversupplied=true end
             end
             if fastFinish then
-                local speedNeed=enemy.troops*(Config.BUDGET_RATIO_MAX or 0.5)/math.max(0.001,2*(Config.SPEED_RATIO_DIV or 5))
-                oversupplied=front.troops>=math.max(Config.MIN_ATTACK_TROOPS or 250,speedNeed*1.5) and not stalled
+                oversupplied=front.troops>=Strategy.finish_strength(enemy) and not stalled
+                ready=true
             end
             if ready and not oversupplied then
                 local score=(depleted and 1000 or 0)+(id~=0 and 100 or 0)-front.troops/math.max(1,committed)
@@ -1998,6 +2073,7 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
     if send({t="attack",tile=best.tile,ratio=best.ratio},"bestaand front "..best.id.." gericht versterken") then
         best.record.at=now;best.record.bursts=best.record.bursts+1
         best.record.captureAt=state.lastCaptureAt or -10000
+        best.record.tiles=state.players[best.id] and state.players[best.id].tiles
         if state.frontProgress and state.frontProgress[best.id] then state.frontProgress[best.id].at=now end
         state.boosts[best.id]=best.record;state.lastSend=now
     end
@@ -2499,6 +2575,7 @@ local function run_step_inner()
         state.reason="VERDEDIGEN: "..(critical and "zware druk; " or "")..(state.counterReason or "tegenaanval loopt of wacht op herbeoordeling").." | thuisreserve "..math.ceil(hold)
         return
     end
+    if Strategy.quick_campaign(targets) then return end
     local mapGeneration=state.generation
     Strategy.water_targets()
     if mapGeneration~=state.generation or not state.ready or not fresh() or #state.incoming>0 then return end
@@ -2766,6 +2843,7 @@ function Recorder.render()
 end
 function Recorder.tick_inner()
  local now=os.clock()
+ if state.phase=="playing" and next(state.players) then Recorder.matchObserved=true end
  Recorder.system("Data",state.ready and "gereed" or "wachten",state.engineFault or state.mapFault or
   string.format("spelers %.1fs / fronten %.1fs oud",now-state.lastPlayers,now-state.lastFronts))
  Recorder.system("Uitbreiding",options.expand and "ingeschakeld" or "uit",state.reason or "wachten op planner")
