@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="5.5-open-land-race"
+local VERSION="5.6-catch-up-strategy"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -18,7 +18,7 @@ local options={queue=false,spawn=false,expand=false,attack=false,defend=false,le
  protect=true,cities=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
- growthAware=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
+ growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
 if type(getgenv)=="function" then
@@ -250,6 +250,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Huizen van zwakke landen heel houden","preserveBotCities")
  toggle("Oorlog","Groeicurve benutten","growthAware")
  toggle("Oorlog","Adaptief uitbreidingstempo","adaptiveTempo")
+ toggle("Oorlog","Inhaalstrategie bij dominante speler","catchUp")
  toggle("Oorlog","Bouwen naast militaire orders","parallelActions")
  toggle("Oorlog","Lopende fronten versterken","reinforce")
  toggle("Oorlog","Reinforcement met goud kopen","buyReinforcements")
@@ -354,7 +355,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=5.5")
+]=],snapshot,RAW_URL.."?v=5.6")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -840,12 +841,37 @@ function Strategy.target_score(id,tile,distance,pressure)
         +math.min(200,(state.planBorders and state.planBorders[id]) or 0)*2,
         cities,enemy.isBot==true
 end
+function Strategy.update_catchup()
+    local previous=state.catchupLeader
+    local me=state.players[state.id]
+    local best,bestScore=nil,0
+    local total=0
+    for _,entry in pairs(state.players) do if entry.alive then total+=entry.tiles or 0 end end
+    if options.catchUp and me and me.alive and me.tiles>0 then
+        for id,entry in pairs(state.players) do
+            if id~=state.id and entry.alive and entry.isBot~=true and not friendly(id) then
+                local land=(entry.tiles or 0)/math.max(1,me.tiles)
+                local army=entry.troops/math.max(1,me.troops)
+                local share=(entry.tiles or 0)/math.max(1,total)
+                local remainsDominant=id==previous and ((land>=1.60 and share>=0.25) or army>=2.40)
+                if remainsDominant or (land>=2 and share>=0.30) or army>=3 then
+                    local score=land+army*0.5
+                    if score>bestScore then best,bestScore=id,score end
+                end
+            end
+        end
+    end
+    state.catchupLeader=best;state.catchupActive=best~=nil
+    if previous~=best then
+        log(best and ("INHAALSTRATEGIE: dominante speler "..best.."; eerder haalbare veroveringen en economische investeringen") or "INHAALSTRATEGIE: gewone planning hervat")
+    end
+end
 function Strategy.capacity_plan(targets)
     local me=state.players[state.id]
     state.pressureReason=nil
     if not me or not options.attack or #state.incoming>0 then return nil end
     local fill=me.troops/Strategy.capacity(me)
-    if fill<0.80 then return nil end
+    if fill<(state.catchupActive and 0.60 or 0.80) then return nil end
     local busy={}
     for _,front in ipairs(state.outgoing) do busy[front.id]=true end
     if options.expand and targets[0] and not busy[0] then state.pressureReason="Hoge vulling: vrije grond heeft een beschikbare route";return nil end
@@ -860,7 +886,7 @@ function Strategy.capacity_plan(targets)
     end
     if Strategy.active_orders()>=limit then state.pressureReason="Fronten actief; defensief serverslot behouden";return nil end
     local best,bestRatio,bestHold,bestScore=nil,nil,nil,-math.huge
-    local requiredLead=fill>=0.90 and 1.25 or 1.60
+    local requiredLead=state.catchupActive and (fill>=0.85 and 1.20 or 1.40) or (fill>=0.90 and 1.25 or 1.60)
     local considered=0
     for id,tile in pairs(targets) do
         local enemy=state.players[id]
@@ -1242,7 +1268,7 @@ function Strategy.cluster_candidate(strategic)
             local enemy=state.players[id]
             local _,value=Strategy.city_value(id)
             if enemy and enemy.alive and enemy.isBot~=true and not friendly(id) and enemy.troops>=me.troops*0.60
-                and enemy.troops<=me.troops*1.60 and value>myValue+1 then
+                and (enemy.troops<=me.troops*1.60 or (state.catchupActive and id==state.catchupLeader)) and value>myValue+1 then
                 atWar[id]=true;economicTargets[id]=true
             end
         end
@@ -1355,6 +1381,7 @@ function Strategy.action_delay()
     local me=state.players[state.id]
     if not me or not me.alive or not state.ready then return options.interval end
     local fill=me.troops/Strategy.capacity(me)
+    if state.catchupActive and fill>=0.40 then return math.min(options.interval,1) end
     local growth=state.territoryGrowth or {}
     local myRate=growth[state.id] or 0
     local racing=false
@@ -1453,6 +1480,7 @@ function Strategy.city_affordable(cost,free,count,defensive)
     if free then return true end
     if type(cost)~="number" or cost<0 or not state.gold or state.gold<cost then return false end
     local floor=options.goldReserve
+    if state.catchupActive and not defensive and #state.incoming==0 then floor*=0.50 end
     if count<3 and not defensive then floor=0 end
     return state.gold-cost>=floor
 end
@@ -1589,6 +1617,11 @@ end
 function Strategy.open_ready(ratio,hold)
     if not ratio then return false end
     local me=state.players[state.id]
+    if state.catchupActive and me and #state.incoming==0 and me.troops>=Strategy.capacity(me)*0.35
+        and ratio<=0.25 and me.troops-math.floor(me.troops*ratio)>=(hold or math.huge) then
+        state.economicStatus="Inhaalstrategie: eerder betaalbare open-landpuls"
+        return true
+    end
     if Strategy.open_rival() and me and ratio<=0.25 and me.troops-math.floor(me.troops*ratio)>=(hold or math.huge) then
         state.economicStatus="Open-landrace: kleine preset; thuisleger op peil bij enige menselijke buur"
         return true
@@ -1933,7 +1966,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
-        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000
+        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
@@ -2194,6 +2227,7 @@ local function run_step_inner()
     if state.phase~="playing" then state.reason="Wachten op start wedstrijd";return end
     if not me or not me.alive or me.tiles<=0 then state.reason="Geen levend eigen rijk gevonden";return end
     if not fresh() then state.reason="Wachten op actuele troepen/fronten";return end
+    Strategy.update_catchup()
     local defending=options.defend and #state.incoming>0
     if not defending and (state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100)) then state.reason="Wachten op server na order";return end
     local targets=enemy_targets()
@@ -2236,7 +2270,7 @@ local function run_step_inner()
     if Strategy.try_nuke() then return end
     local pressureId,pressureRatio,pressureHold=Strategy.capacity_plan(targets)
     if pressureId then
-        if send({t="attack",tile=targets[pressureId],ratio=pressureRatio},"CAPACITEITSKEUZE: "..state.pressureReason.." | thuisreserve "..math.ceil(pressureHold)) then
+        if send({t="attack",tile=targets[pressureId],ratio=pressureRatio},(state.catchupActive and "INHAALKEUZE: " or "CAPACITEITSKEUZE: ")..state.pressureReason.." | thuisreserve "..math.ceil(pressureHold)) then
             state.lastSend=os.clock();state.breakout={id=pressureId,untilTime=os.clock()+90}
         end
         return
