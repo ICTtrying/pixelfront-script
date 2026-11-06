@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="5.2-opportunity-defense"
+local VERSION="5.3-interleaved-planner"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -18,7 +18,7 @@ local options={queue=false,spawn=false,expand=false,attack=false,defend=false,le
  protect=true,cities=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
- growthAware=true,adaptiveTempo=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
+ growthAware=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
 if type(getgenv)=="function" then
@@ -250,6 +250,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Huizen van zwakke landen heel houden","preserveBotCities")
  toggle("Oorlog","Groeicurve benutten","growthAware")
  toggle("Oorlog","Adaptief uitbreidingstempo","adaptiveTempo")
+ toggle("Oorlog","Bouwen naast militaire orders","parallelActions")
  toggle("Oorlog","Lopende fronten versterken","reinforce")
  toggle("Oorlog","Reinforcement met goud kopen","buyReinforcements")
  label("Oorlog","Atoomnukes: vijandelijke huizenclusters of een veilige vijandelijke zone achter een actieve aanval. Economische eerste aanval alleen tegen een nabije rivaal met betere huizeneconomie. Geen bekende SAM-dekking of eigen/geallieerde grond binnen de explosie. Goud, tokens en spelregels blijven bepalend.",160)
@@ -353,7 +354,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=5.2")
+]=],snapshot,RAW_URL.."?v=5.3")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1081,7 +1082,16 @@ function Strategy.open_tile()
                 neighbours(tile,function(other)
                     if passable(other) and buffer.readu8(state.owners,other)==0 then free=free+1 end
                 end)
-                local score=free*3-Strategy.nearby_danger(tile)*8-bit32.band(buffer.readu8(state.terrain,tile),63)*0.1
+                local space=0
+                local x,y=tile%W,math.floor(tile/W)
+                for _,offset in ipairs({{8,0},{-8,0},{0,8},{0,-8},{16,0},{-16,0},{0,16},{0,-16}}) do
+                    local px,py=x+offset[1],y+offset[2]
+                    if px>=0 and px<W and py>=0 and py<H then
+                        local probe=py*W+px
+                        if passable(probe) and buffer.readu8(state.owners,probe)==0 then space+=1 end
+                    end
+                end
+                local score=free*3+space*2-Strategy.nearby_danger(tile)*8-bit32.band(buffer.readu8(state.terrain,tile),63)*0.1
                 if score>bestScore then best,bestScore=tile,score end
             end
         end
@@ -1311,12 +1321,32 @@ function Strategy.action_delay()
     if fill>=0.45 then return math.min(options.interval,1.5) end
     return options.interval
 end
+function Strategy.interleave_ready(kind)
+    if not options.parallelActions or options.dry or not alive or not state.ready or state.phase~="playing"
+        or state.engineFault or state.awaitingInit or (state.protocolBlocks and next(state.protocolBlocks)) or not fresh() then return false end
+    local me=state.players[state.id]
+    if not me or not me.alive or state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
+    local now=os.clock()
+    if now-state.lastAction<0.25 or now-state.lastAction>=Strategy.action_delay() then return false end
+    local last=state.lastCommand
+    if not last then return false end
+    if kind=="attack" then
+        return last.t=="build" and now-(state.lastTroopOrder or -10000)>=Strategy.action_delay()
+    elseif kind=="build" then
+        return last.t=="attack" and now-(state.lastBuild or -10000)>=options.buildDelay
+    end
+    return false
+end
+function Strategy.order_ready(kind)
+    return os.clock()-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
+end
 local function send(payload,description)
-    if os.clock()-state.lastAction<Strategy.action_delay() then return false end
+    if not Strategy.order_ready(payload.t) then return false end
     state.lastAction=os.clock()
     if options.dry then state.reason="Observatie: "..description;log("PLAN: "..description); return false end
     folder.Intent:FireServer(payload)
-    state.lastCommand=payload
+    state.lastCommand=payload;state.orderSerial=(state.orderSerial or 0)+1
+    if payload.t=="attack" then state.lastTroopOrder=os.clock() end
     if payload.t=="attack" and state.owners and state.frontier[payload.tile] then
         state.landOrders=state.landOrders or {}
         state.landOrders[buffer.readu8(state.owners,payload.tile)]={tile=payload.tile,at=os.clock()}
@@ -1830,7 +1860,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
-        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0
+        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
@@ -2050,7 +2080,7 @@ local function run_step_inner()
         end
         return
     end
-    if os.clock()-state.lastAction<Strategy.action_delay() then state.reason="Actievertraging";return end
+    if not Strategy.order_ready("attack") and not Strategy.order_ready("build") then state.reason="Actievertraging";return end
     if role=="lobby" then
         if not options.queue then state.reason="Auto join staat uit";return end
         if os.clock()-(state.boardAt or 0)>10 then state.reason="Wachten op actuele lobbylijst";return end
@@ -2276,7 +2306,14 @@ end
 
 local function run_step()
     state.planContext={}
-    local ok,result=xpcall(run_step_inner,debug.traceback)
+    local before=state.orderSerial or 0
+    local ok,result=xpcall(function()
+        run_step_inner()
+        if (state.orderSerial or 0)==before and Strategy.interleave_ready("build") then
+            if #state.incoming>0 then Strategy.try_build(true)
+            elseif not Strategy.try_shield() then Strategy.try_build(false) end
+        end
+    end,debug.traceback)
     state.contactScansLast=(state.planContext and state.planContext.scans) or 0
     state.planContext=nil
     if not ok then error(result,0) end
