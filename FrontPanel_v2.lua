@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.6-structure-tables"
+local VERSION="3.7-map-geometry"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -349,7 +349,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.6")
+]=],snapshot,RAW_URL.."?v=3.7")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -362,7 +362,7 @@ end)
  log("Teleport-hook verbonden.")
 end
 
-local Config,Net,MapGen,Matchmaker,Scenarios,Nukes,folder
+local Config,Net,MapGen,Matchmaker,Scenarios,Nukes,folder,Maps
 local W,H,N
 local Strategy={}
 local message_decoders={
@@ -642,6 +642,62 @@ local function finish_map()
         state.indexing=true
         index_map(state.generation)
     end
+end
+local function resolve_geometry(payload,terrain)
+    local count=buffer.len(terrain)
+    local candidates={}
+    local function add(w,h,label)
+        if type(w)=="number" and type(h)=="number" then candidates[#candidates+1]={w,h,label} end
+    end
+    add(payload.mapWidth,payload.mapHeight,"init.mapWidth")
+    add(payload.width,payload.height,"init.width")
+    if Maps and type(Maps.get)=="function" then
+        local ok,data=pcall(Maps.get,payload.mapId or "us")
+        if ok and type(data)=="table" then
+            add(data.WIDTH,data.HEIGHT,"Maps.get")
+            add(data.width,data.height,"Maps.get.width")
+        end
+    end
+    add(Config.MAP_W,Config.MAP_H,"Config")
+    local details={}
+    for _,entry in ipairs(candidates) do
+        local w,h=entry[1],entry[2]
+        details[#details+1]=entry[3].."="..w.."x"..h
+        if w>0 and h>0 and w%1==0 and h%1==0 and w<=8192 and h<=8192 and w*h==count and count<=16000000 then
+            return w,h,count,entry[3]
+        end
+    end
+    error("Kaartmetadata wijkt af: terrein="..count.." bytes; "..table.concat(details,", "))
+end
+local function finalize_snapshot()
+    if state.waitingDimensions or not state.snapshotComplete then return end
+    local input=state.snapshot
+    local owners=buffer.create(N)
+    if state.snapshotRaw then
+        assert(buffer.len(input)==N,"Raw kaartlengte wijkt af van terrein")
+        buffer.copy(owners,0,input)
+    else
+        local r,pos,total=0,0,buffer.len(input)
+        while r<total do
+            local owner=buffer.readu8(input,r);r+=1
+            local run,scale=0,1
+            for step=1,5 do
+                assert(r<total,"Onvolledige kaartrun")
+                local value=buffer.readu8(input,r);r+=1
+                run+=(value%128)*scale
+                if value<128 then break end
+                assert(step<5,"Kaartvarint te lang")
+                scale*=128
+            end
+            assert(run>0 and run<=N-pos,"Kaart-RLE buiten bereik")
+            buffer.fill(owners,pos,owner,run);pos+=run
+        end
+        assert(pos==N,"Onvolledige kaartdekking")
+    end
+    state.owners=owners;state.snapshotReady=true
+    state.snapshot=nil;state.snapshotComplete=false
+    for _,data in ipairs(state.pending) do if not apply_delta(data) then return end end
+    state.pending={};finish_map()
 end
 local function fresh()
     return state.ready and os.clock()-state.lastPlayers<5 and os.clock()-state.lastFronts<5
@@ -1273,6 +1329,11 @@ local function choose_spawn()
     return best
 end
 local function state_event(kind,payload,extra)
+    if kind=="structs" and state.waitingDimensions then
+        assert(#state.deferredStructures<128,"Te veel gebouwupdates tijdens kaartladen")
+        state.deferredStructures[#state.deferredStructures+1]=payload
+        return
+    end
     if kind=="roster" or kind=="structs" or kind=="players" or kind=="vehicles" or kind=="armies" then
         local list=message_list(kind,payload,kind=="players")
         if not list then return end
@@ -1317,6 +1378,7 @@ local function state_event(kind,payload,extra)
         state.players={}; state.allies={}; state.incoming={}; state.outgoing={}
         state.frontier={}; state.representatives={}; state.pending={}
         state.owners=buffer.create(N); state.terrain=nil; state.ready=false
+        state.waitingDimensions=true;state.deferredStructures={};state.snapshotComplete=false;state.snapshotCovered=0
         state.snapshotReady=false; state.snapshot=nil; state.chunks={}; state.seen=0
         state.indexing=false; state.spawned=false; state.spawnAt=-100
         state.lastPlayers=0; state.lastFronts=0; state.lastSend=-100;state.playingAt=os.clock()
@@ -1325,26 +1387,35 @@ local function state_event(kind,payload,extra)
         task.spawn(guard(function()
             local terrain=MapGen.generate(payload.mapId or "us",payload.seed)
             if alive and generation==state.generation then
-                assert(buffer.len(terrain)==N,"Afwijkende kaartgrootte")
-                state.terrain=terrain
-                finish_map()
+                local width,height,count,source=resolve_geometry(payload,terrain)
+                W,H,N=width,height,count
+                state.owners=buffer.create(N);state.terrain=terrain;state.waitingDimensions=false
+                log("Kaartafmetingen: "..W.."x"..H.." | "..source)
+                local deferred=state.deferredStructures;state.deferredStructures={}
+                for _,message in ipairs(deferred) do state_event("structs",message) end
+                finalize_snapshot()
             end
         end))
     elseif kind=="snapshot" and payload.round==state.round then
-        assert(payload.bytes>0 and payload.bytes<=N*8,"Onverwachte snapshotgrootte")
-        if not state.snapshot then state.snapshot=buffer.create(payload.bytes) end
+        local function integer(v) return type(v)=="number" and v%1==0 end
+        assert(integer(payload.bytes) and payload.bytes>0 and payload.bytes<=128000000,"Onverwachte snapshotgrootte")
+        assert(integer(payload.count) and payload.count>0 and payload.count<=65536,"Ongeldig aantal kaartdelen")
+        assert(integer(payload.index) and payload.index>=0 and payload.index<=payload.count,"Ongeldig kaartdeel")
+        assert(typeof(payload.data)=="buffer" and integer(payload.offset) and payload.offset>=0 and payload.offset+buffer.len(payload.data)<=payload.bytes,"Kaartdeel buiten bereik")
+        if not state.snapshot then
+            state.snapshot=buffer.create(payload.bytes)
+            state.snapshotCount=payload.count;state.snapshotRaw=payload.raw==true
+        end
+        assert(buffer.len(state.snapshot)==payload.bytes and state.snapshotCount==payload.count and state.snapshotRaw==(payload.raw==true),"Verschillende kaartdeelmetadata")
         if not state.chunks[payload.index] then
+            local ending=payload.offset+buffer.len(payload.data)
+            for _,range in pairs(state.chunks) do assert(ending<=range[1] or payload.offset>=range[2],"Overlappende kaartdelen") end
             buffer.copy(state.snapshot,payload.offset,payload.data)
-            state.chunks[payload.index]=true; state.seen=state.seen+1
+            state.chunks[payload.index]={payload.offset,ending};state.seen+=1
+            state.snapshotCovered+=buffer.len(payload.data)
             if state.seen==payload.count then
-                if payload.raw then
-                    assert(buffer.len(state.snapshot)==N,"Onverwachte raw snapshot")
-                    buffer.copy(state.owners,0,state.snapshot)
-                else Net.unpackOwners(state.snapshot,state.owners) end
-                state.snapshotReady=true
-                for _,data in ipairs(state.pending) do if not apply_delta(data) then return end end
-                state.pending={}; state.snapshot=nil
-                finish_map()
+                assert(state.snapshotCovered==payload.bytes,"Ontbrekende kaartbytes")
+                state.snapshotComplete=true;finalize_snapshot()
             end
         end
     elseif kind=="roster" then
@@ -1624,8 +1695,12 @@ task.spawn(guard(function()
         if ok and type(value)=="table" and type(value.magnitude)=="function" then Nukes=value
         else log("Nukeplanner niet beschikbaar: "..tostring(value)) end
     end
+    if shared:FindFirstChild("Maps") then
+        local ok,value=pcall(load_module,shared,"Maps")
+        if ok then Maps=value end
+    end
     W,H,N=Config.MAP_W,Config.MAP_H,Config.NUM_TILES
-    assert(type(W)=="number" and type(H)=="number" and N==W*H and N<=4000000,"Onbekende kaartconfiguratie")
+    assert(type(W)=="number" and type(H)=="number" and N==W*H and N<=16000000,"Onbekende kaartconfiguratie")
     assert(type(Config.attackPresets)=="function" and type(Net.unpackPlayers)=="function","Spelversie wijkt af")
     folder=RS:WaitForChild("ConquestNet",15)
     assert(folder,"ConquestNet ontbreekt")
