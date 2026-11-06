@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="4.2-island-strategy"
+local VERSION="4.3-growth-priority"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -351,7 +351,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=4.2")
+]=],snapshot,RAW_URL.."?v=4.3")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -990,7 +990,7 @@ function Strategy.risk_reserve()
     local incoming=0
     for _,a in ipairs(state.incoming) do incoming=incoming+a.troops end
     state.strongestNeighbour=rawTop;state.weightedThreat=top;state.neighbourCount=count
-    return math.ceil(top*0.65+second*0.20+total*0.20+incoming*1.20)
+    return math.ceil(top*0.35+second*0.10+total*0.07+incoming*1.20)
 end
 function Strategy.sample_owned(tile)
     if not state.ownedSamples then state.ownedSamples={} end
@@ -1833,7 +1833,23 @@ local function run_step()
                 and Strategy.opportunity_ratio(id,state.targetProtected[id]) then parallelOpportunity=true;break end
         end
     end
-    if not parallelOpportunity and Strategy.try_build(false) then return end
+    local reserveBeforePlanning=state.requiredReserve
+    local capPressure=me.troops>=Strategy.capacity(me)*0.80
+    local freeExpansion=options.expand and targets[0]~=nil and choose_ratio(false,true)~=nil
+    local cheapCapture=false
+    if options.attack or options.expand then
+        local occupied={}
+        for _,front in ipairs(state.outgoing) do occupied[front.id]=true end
+        for id in pairs(targets) do
+            local enemy=state.players[id]
+            if id~=0 and not occupied[id] and enemy and (options.attack or enemy.isBot==true)
+                and enemy.troops<=me.troops*0.20 and Strategy.opportunity_ratio(id,state.targetProtected[id]) then cheapCapture=true;break end
+        end
+    end
+    local growthPriority=capPressure and (freeExpansion or cheapCapture)
+        and Strategy.active_orders()<math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
+    state.requiredReserve=reserveBeforePlanning
+    if not parallelOpportunity and not growthPriority and Strategy.try_build(false) then return end
     local normalReserve=state.requiredReserve
     local economicRatio=choose_ratio(false,true)
     local economicReserve=state.requiredReserve
@@ -1860,6 +1876,13 @@ local function run_step()
                 local score=Strategy.target_score(id,tile,0)
                 if orderRatio and score and score>bestScore then weakest,bestScore,bestRatio,bestReserve=id,score,orderRatio,orderReserve end
             end
+        end
+        local selectedEnemy=weakest and state.players[weakest]
+        if targets[0] and not busy[0] and options.expand and economicRatio and economicReady
+            and (not weakest or (selectedEnemy and selectedEnemy.isBot~=true and selectedEnemy.troops>me.troops*0.20)) then
+            local open=Strategy.open_tile()
+            if open and send({t="attack",tile=open,ratio=economicRatio},"PLAN GROEI: vrije grond benutten; reserve "..math.ceil(economicReserve or 0)) then state.lastSend=os.clock() end
+            return
         end
         if not weakest and attacksAllowed then
             local escape,escapeRatio,escapeReserve=Strategy.breakout_plan(targets)
@@ -1913,6 +1936,10 @@ local function run_step()
         if options.expand and targets[0] and not busy[0] and economicRatio and economicReady then
             local tile=Strategy.open_tile()
             if tile and send({t="attack",tile=tile,ratio=economicRatio},"groeivenster benutten: uitbreiden via minder bedreigde grens") then state.lastSend=os.clock() end
+            return
+        end
+        if not ratio and not economicRatio then
+            state.reason="Reserve blokkeert order: leger "..math.floor(me.troops).." | strijd "..math.ceil(normalReserve or 0).." | groei "..math.ceil(economicReserve or 0)
             return
         end
         state.reason=state.island and ("Eiland: "..(state.waterSearchInfo or "zoekronde afwachten").."; geen betaalbare veilige landing") or "Geen betaalbaar veilig doel; wachten op troepen of beschikbare grens"
