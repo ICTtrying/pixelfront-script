@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.7-map-geometry"
+local VERSION="3.8-opportunity-strategy"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -349,7 +349,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.7")
+]=],snapshot,RAW_URL.."?v=3.8")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -737,6 +737,22 @@ function Strategy.threat_factor(id)
     local cities=Strategy.city_value(id)
     return cities>0 and 0.45 or 0.20
 end
+function Strategy.opportunity_ratio(id,covered)
+    local me,enemy=state.players[state.id],state.players[id]
+    if not me or not enemy or not enemy.alive or friendly(id) or me.troops<=0 then return nil end
+    if me.troops<enemy.troops*options.strength then return nil end
+    local capacity=Strategy.capacity(me)
+    local required=math.min(capacity*options.reserve/100,me.troops*0.30)
+    if options.protect then required=math.max(required,Strategy.risk_reserve()) end
+    local multiplier=covered and 2 or (enemy.isBot==true and 0.9 or 1.4)
+    local needed=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*multiplier)
+    local best=nil
+    for _,ratio in ipairs(Config.attackPresets(state.mode)) do
+        local committed=math.floor(me.troops*ratio)
+        if committed>=needed and me.troops-committed>=required and (not best or ratio<best) then best=ratio end
+    end
+    return best,required
+end
 function Strategy.target_score(id,tile,distance)
     local me,enemy=state.players[state.id],state.players[id]
     if not me or not enemy or not enemy.alive or friendly(id) then return nil end
@@ -744,7 +760,9 @@ function Strategy.target_score(id,tile,distance)
     if me.troops<enemy.troops*options.strength then return nil end
     local cities,value,complete=Strategy.city_value(id)
     local priority=enemy.isBot==true and 2 or 1
-    if enemy.isBot==true and options.botCities and cities>0 then priority=3 end
+    if enemy.isBot==true and options.botCities and cities>0 then priority=4 end
+    local exposed=enemy.isBot~=true and enemy.troops<=me.troops*0.12
+    if exposed then priority=3.5 end
     return priority*100000+math.min(value,100)*100+math.min(complete,30)*50
         -enemy.troops/math.max(1,me.troops)*200-Strategy.nearby_danger(tile)*50-(distance or 0)*4,
         cities,enemy.isBot==true
@@ -938,7 +956,8 @@ function Strategy.build_spot(kind)
                 local danger=Strategy.nearby_danger(tile)
                 local score=nil
                 local blast=Nukes and Nukes.magnitude(13)
-                local citySpacing=(blast and blast.outer or 30)*2+8
+                local ownCities=Strategy.city_value(state.id)
+                local citySpacing=ownCities<3 and spacing or (blast and blast.outer or 30)*2+8
                 if kind==1 and danger<1 and same>=citySpacing then
                     local own=0
                     local x,y=tile%W,math.floor(tile/W)
@@ -946,7 +965,7 @@ function Strategy.build_spot(kind)
                         local px,py=x+d[1],y+d[2]
                         if px>=0 and px<W and py>=0 and py<H and buffer.readu8(state.owners,py*W+px)==state.id then own=own+1 end
                     end
-                    if own>=4 then score=own*10+math.min(same,70)-danger*80 end
+                    if own>=(ownCities<3 and 2 or 4) then score=own*10+math.min(same,70)-danger*80 end
                 elseif kind==3 then
                     local border=math.huge
                     for _,c in pairs(contacts) do
@@ -1078,6 +1097,13 @@ function Strategy.try_nuke()
     end
     return true
 end
+function Strategy.city_affordable(cost,free,count,defensive)
+    if free then return true end
+    if type(cost)~="number" or cost<0 or not state.gold or state.gold<cost then return false end
+    local floor=options.goldReserve
+    if count<3 and not defensive then floor=0 end
+    return state.gold-cost>=floor
+end
 function Strategy.try_build(defensive)
     if not state.structuresReady or not state.gold or os.clock()-(state.lastBuild or -10000)<options.buildDelay then return false end
     local contacts=Strategy.contacts()
@@ -1093,7 +1119,7 @@ function Strategy.try_build(defensive)
             if free or (cost and state.gold-cost>=options.goldReserve) then tile=Strategy.build_spot(3);kind=3 end
         end
     end
-    if not tile and options.sams then
+    if not tile and options.sams and (defensive or Strategy.city_value(state.id)>=3 or not options.cities) then
         free=(state.freeSams or 0)>0;cost=state.samCost;kind=5
         if free or (cost and state.gold-cost>=options.goldReserve) then tile=Strategy.sam_spot() end
     end
@@ -1101,7 +1127,7 @@ function Strategy.try_build(defensive)
         local cities={}
         for _,s in pairs(state.structures) do if s.ownerId==state.id and s.kind==1 then table.insert(cities,s) end end
         cost=state.cityCost;free=(state.freeCities or 0)>0;kind=1
-        if #cities<options.maxCities and (free or (cost and state.gold-cost>=options.goldReserve)) then tile=Strategy.build_spot(1) end
+        if #cities<options.maxCities and Strategy.city_affordable(cost,free,#cities,defensive) then tile=Strategy.build_spot(1) end
         if not tile and options.upgradeCities and cost and state.gold-cost>=options.goldReserve then
             local lowest=math.huge
             for _,s in ipairs(cities) do
@@ -1614,31 +1640,25 @@ local function run_step()
     state.economicReserve=economicReserve
     state.requiredReserve=normalReserve
     local economicReady=Strategy.growth_ready(economicRatio)
-    if Strategy.try_reinforce(targets,ratio,economicRatio,economicReady) then return end
-    if not ratio and not economicRatio then state.reason="Troepen bewaren: reserve of sterke buurlanden vereisen meer verdediging";return end
     local active=Strategy.active_orders()
     local allowedFronts=state.transportKnown==false and 1 or options.maxFronts
     if active>=math.min(allowedFronts,Config.MAX_FRONTS_PER_PLAYER or 4) then
+        if Strategy.try_reinforce(targets,ratio,economicRatio,economicReady) then return end
         state.reason="Frontenlimiet bereikt ("..active.."); bestaande legers/transporten afwachten";return
     end
     local busy={}
     for _,front in ipairs(state.outgoing) do busy[front.id]=true end
-    if options.expand and targets[0] and not busy[0] and economicRatio and economicReady then
-        local tile=Strategy.open_tile()
-        if tile and send({t="attack",tile=tile,ratio=economicRatio},"groeivenster benutten: uitbreiden via minder bedreigde grens") then state.lastSend=os.clock() end
-        return
-    end
     if options.attack or options.expand then
         local truce=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
-        if os.clock()-(state.playingAt or 0)<truce then state.reason="Beginbescherming afwachten";return end
-        local weakest,bestScore,bestRatio=nil,-math.huge,nil
+        local attacksAllowed=os.clock()-(state.playingAt or 0)>=truce
+        local weakest,bestScore,bestRatio,bestReserve=nil,-math.huge,nil,nil
         for id,tile in pairs(targets) do
-            if id~=0 and not busy[id] and (not options.protect or not state.targetProtected[id]) then
+            if attacksAllowed and id~=0 and not busy[id] then
                 local enemy=state.players[id]
                 local economic=enemy and enemy.isBot==true
-                local orderRatio=economic and economicRatio or ratio
+                local orderRatio,orderReserve=Strategy.opportunity_ratio(id,state.targetProtected[id])
                 local score=Strategy.target_score(id,tile,0)
-                if orderRatio and (not economic or economicReady) and score and score>bestScore then weakest,bestScore,bestRatio=id,score,orderRatio end
+                if orderRatio and score and score>bestScore then weakest,bestScore,bestRatio,bestReserve=id,score,orderRatio,orderReserve end
             end
         end
         if not weakest then state.reason="Geen nieuw veilig landfront; wateroversteek onderzoeken" end
@@ -1650,7 +1670,7 @@ local function run_step()
                 local orderRatio=economic and economicRatio or ratio
                 local score=id==0 and options.expand and 0 or Strategy.target_score(id,entry.tile,entry.distance)
                 local pending=state.riverOrders[id]
-                if orderRatio and (not economic or economicReady) and score and not targets[id] and not busy[id] and not friendly(id)
+                if (id==0 or attacksAllowed) and orderRatio and (not economic or economicReady) and score and not targets[id] and not busy[id] and not friendly(id)
                     and (not pending or pending.untilTime<=os.clock()) then
                     if score>waterScore then targetId,target,waterScore,waterRatio,waterReserve=id,entry,score,orderRatio,economic and economicReserve or normalReserve end
                 end
@@ -1670,10 +1690,18 @@ local function run_step()
             local cityCount=Strategy.city_value(weakest)
             local bot=state.players[weakest].isBot==true
             local description=bot and ("botland "..weakest.." veroveren; "..cityCount.." zichtbare steden") or "voorzichtige aanval op speler/onbekend land "..weakest
+            state.requiredReserve=math.ceil(bestReserve or normalReserve or 0)
+            description=description.." | inzet "..math.floor(me.troops*bestRatio).." | thuis "..math.floor(me.troops*(1-bestRatio))
             if send({t="attack",tile=targets[weakest],ratio=bestRatio},description) then state.lastSend=os.clock() end
             return
         end
-        if options.growthAware and not economicReady then state.reason="Eerst groeien tot economisch ordervenster; gevaarlijke buren blijven meetellen" end
+        if Strategy.try_reinforce(targets,ratio,economicRatio,economicReady) then return end
+        if options.expand and targets[0] and not busy[0] and economicRatio and economicReady then
+            local tile=Strategy.open_tile()
+            if tile and send({t="attack",tile=tile,ratio=economicRatio},"groeivenster benutten: uitbreiden via minder bedreigde grens") then state.lastSend=os.clock() end
+            return
+        end
+        state.reason="Geen betaalbaar veilig doel; wachten op troepen of beschikbare grens"
     else state.reason="Uitbreiden en aanvallen staan uit"
     end
 end
