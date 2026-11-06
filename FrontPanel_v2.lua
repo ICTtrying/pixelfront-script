@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="4.1-adaptive-campaign"
+local VERSION="4.2-island-strategy"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -17,7 +17,7 @@ local options={queue=false,spawn=false,expand=false,attack=false,defend=false,le
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
  protect=true,cities=true,posts=true,nukes=false,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
- rivers=true,sams=true,maxFronts=3,riverRange=24,maxSams=4,botCities=true,preserveBotCities=true,
+ rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  growthAware=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
@@ -34,7 +34,7 @@ local function valid_settings(value)
  end
  for key,range in pairs({reserve={10,90},strength={1.2,10},interval={2,30},
   goldReserve={0,10000000},minCluster={2,12},nukeDelay={30,300},maxCities={1,40},
-  maxCityLevel={1,10},buildDelay={5,60},maxFronts={1,4},riverRange={4,48},maxSams={1,12},
+  maxCityLevel={1,10},buildDelay={5,60},maxFronts={1,4},riverRange={4,48},seaRange={48,512},maxSams={1,12},
   growthFloor={15,60},reinforceDelay={4,30},maxBoosts={1,5}}) do
   local n=value[key]
   if type(n)=="number" and n==n and n>=range[1] and n<=range[2] then options[key]=n end
@@ -145,7 +145,7 @@ local function refresh_toggles()
   item.button.Text=item.name..": "..(options[key] and "AAN" or "UIT")
   item.button.BackgroundColor3=options[key] and Color3.fromRGB(30,125,80) or Color3.fromRGB(35,80,145)
  end
- title.Text="FRONT PANEL 3.6 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
+ title.Text="FRONT PANEL "..VERSION.." | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
 local function halt(reason)
  for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams","reinforce","buyReinforcements"}) do options[key]=false end
@@ -243,7 +243,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Steden bouwen","cities")
  toggle("Oorlog","Grensposten bouwen","posts")
  toggle("Oorlog","Nuke op vijandelijk cluster","nukes")
- toggle("Oorlog","Rivieren oversteken","rivers")
+ toggle("Oorlog","Rivieren en zee oversteken","rivers")
  toggle("Oorlog","Anti-nuke bij steden","sams")
  toggle("Oorlog","Botlanden met steden eerst","botCities")
  toggle("Oorlog","Zwakke botsteden heel houden","preserveBotCities")
@@ -266,7 +266,8 @@ local ui_ok,ui_error=xpcall(function()
  number_input("Instellen","Minimale steden in nukecluster","minCluster",2,12)
  number_input("Instellen","Seconden tussen nukes","nukeDelay",30,300)
  number_input("Instellen","Maximale actieve fronten incl. transport","maxFronts",1,4)
- number_input("Instellen","Maximale waterzoekafstand in tegels","riverRange",4,48)
+ number_input("Instellen","Zoekafstand bij rivieren","riverRange",4,48)
+ number_input("Instellen","Zoekafstand vanaf opgesloten eiland","seaRange",48,512)
  number_input("Instellen","Maximale anti-nuketorens","maxSams",1,12)
  number_input("Instellen","Rustige uitbreiding: minimale reserve %","growthFloor",15,60)
  number_input("Instellen","Seconden tussen versterkingen per doel","reinforceDelay",4,30)
@@ -350,7 +351,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=4.1")
+]=],snapshot,RAW_URL.."?v=4.2")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -847,12 +848,35 @@ function Strategy.contacts()
     return contacts
 end
 function Strategy.water_targets()
-    if not options.rivers then state.waterTargets={};return state.waterTargets end
+    if not options.rivers then state.waterTargets={};state.island=false;state.waterSearchInfo="Wateroversteken staat uit";return state.waterTargets end
     if os.clock()-(state.lastWaterScan or -10000)<6 then return state.waterTargets or {} end
     state.lastWaterScan=os.clock()
+    local generation=state.generation
+    local landExit=false
+    for tile in pairs(state.frontier) do
+        local id=buffer.readu8(state.owners,tile)
+        if id==0 or not friendly(id) then landExit=true;break end
+    end
+    local island=not landExit
+    local searchRange=island and math.max(options.riverRange,options.seaRange) or options.riverRange
+    local searchBudget=island and math.min(N,100000) or 12000
+    state.island=island
     local queue,depth,seen,targets={},{},{},{}
+    local candidateScores={}
+    local function landing_value(tile,id,distance)
+        local x,y=tile%W,math.floor(tile/W)
+        local space=0
+        for _,offset in ipairs({{-8,0},{8,0},{0,8},{0,-8},{-16,0},{16,0},{0,16},{0,-16}}) do
+            local px,py=x+offset[1],y+offset[2]
+            if px>=0 and px<W and py>=0 and py<H then
+                local other=py*W+px
+                if passable(other) and buffer.readu8(state.owners,other)==id then space+=1 end
+            end
+        end
+        return space*8-distance
+    end
     local function push(tile,d)
-        if not seen[tile] and #queue<12000 then
+        if not seen[tile] and #queue<searchBudget then
             seen[tile]=true;queue[#queue+1]=tile;depth[#queue]=d
         end
     end
@@ -875,12 +899,25 @@ function Strategy.water_targets()
             if passable(other) then
                 local id=buffer.readu8(state.owners,other)
                 if id~=state.id and (id==0 or not friendly(id)) and (state.blockedLanding[other] or 0)<os.clock() then
-                    if not targets[id] or d<targets[id].distance then targets[id]={tile=other,distance=d} end
+                    local value=landing_value(other,id,d)
+                    if not targets[id] or value>(candidateScores[id] or -math.huge) then
+                        targets[id]={tile=other,distance=d,space=value+d};candidateScores[id]=value
+                    end
                 end
-            elseif d<options.riverRange and not bit32.btest(buffer.readu8(state.terrain,other),128) then
+            elseif d<searchRange and not bit32.btest(buffer.readu8(state.terrain,other),128) then
                 push(other,d+1)
             end
         end)
+        if head%1024==0 then
+            task.wait()
+            if not alive or generation~=state.generation then return {} end
+        end
+    end
+    state.waterSearchInfo="Waterzoeker: "..(island and "eiland/zee" or "rivier").." | bereik "..searchRange.." | onderzocht "..#queue..(head<=#queue and " | afgebroken" or "")
+    if #queue>=searchBudget then state.waterSearchInfo=state.waterSearchInfo.." | zoekbudget bereikt" end
+    if island and os.clock()-(state.lastSeaLog or -10000)>20 then
+        local count=0;for _ in pairs(targets) do count+=1 end
+        log(state.waterSearchInfo.." | doelen "..count);state.lastSeaLog=os.clock()
     end
     state.waterTargets=targets
     return targets
@@ -1761,7 +1798,9 @@ local function run_step()
     if not me or not me.alive or me.tiles<=0 then state.reason="Geen levend eigen rijk gevonden";return end
     if not fresh() then state.reason="Wachten op actuele troepen/fronten";return end
     if state.lastPlayers< (state.lastSend or -100) or state.lastFronts<(state.lastSend or -100) then state.reason="Wachten op server na order";return end
+    local mapGeneration=state.generation
     Strategy.water_targets()
+    if mapGeneration~=state.generation or not state.ready or not fresh() then return end
     if Strategy.try_buy_reinforcements() then return end
     local ratio=choose_ratio(#state.incoming>0)
     local targets=enemy_targets()
@@ -1839,9 +1878,11 @@ local function run_step()
                 local enemy=state.players[id]
                 local economic=id==0 or (enemy and enemy.isBot==true)
                 local orderRatio=economic and economicRatio or ratio
-                local score=id==0 and options.expand and 0 or Strategy.target_score(id,entry.tile,entry.distance)
+                local score=id==0 and options.expand and ((entry.space or 0)-entry.distance*0.25) or Strategy.target_score(id,entry.tile,entry.distance)
+                local boat=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
+                local invasionSafe=id==0 or (enemy and boat>=enemy.troops*(enemy.isBot==true and 1.1 or 1.5))
                 local pending=state.riverOrders[id]
-                if (id==0 or attacksAllowed) and orderRatio and (not economic or economicReady) and score and not targets[id] and not busy[id] and not friendly(id)
+                if invasionSafe and (id==0 or attacksAllowed) and orderRatio and (not economic or economicReady) and score and not targets[id] and not busy[id] and not friendly(id)
                     and (not pending or pending.untilTime<=os.clock()) then
                     if score>waterScore then targetId,target,waterScore,waterRatio,waterReserve=id,entry,score,orderRatio,economic and economicReserve or normalReserve end
                 end
@@ -1849,13 +1890,13 @@ local function run_step()
             local boatTroops=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
             if target and waterScore>bestScore and boatTroops>=(Config.TRANSPORT_BOAT_MIN_TROOPS or 250)
                 and me.troops-boatTroops>=(waterReserve or 0) then
-                if send({t="attack",tile=target.tile,ratio=waterRatio},"rivier/korte waterroute naar "..targetId.."; server kiest landbrug of transport") then
+                if send({t="attack",tile=target.tile,ratio=waterRatio},"wateroversteek naar "..targetId.." | afstand "..target.distance.." | transport ongeveer "..boatTroops.." troepen") then
                     state.lastSend=os.clock()
                     state.riverOrders[targetId]={tile=target.tile,untilTime=os.clock()+60}
                 end
                 return
             end
-            state.reason="Geen veilige beschikbare wateroversteek binnen zoekafstand"
+            state.reason="Geen veilige landing; "..(state.waterSearchInfo or "waterkaart onderzoeken")
         end
         if weakest then
             local cityCount=Strategy.city_value(weakest)
@@ -1874,7 +1915,7 @@ local function run_step()
             if tile and send({t="attack",tile=tile,ratio=economicRatio},"groeivenster benutten: uitbreiden via minder bedreigde grens") then state.lastSend=os.clock() end
             return
         end
-        state.reason="Geen betaalbaar veilig doel; wachten op troepen of beschikbare grens"
+        state.reason=state.island and ("Eiland: "..(state.waterSearchInfo or "zoekronde afwachten").."; geen betaalbare veilige landing") or "Geen betaalbaar veilig doel; wachten op troepen of beschikbare grens"
     else state.reason="Uitbreiden en aanvallen staan uit"
     end
 end
