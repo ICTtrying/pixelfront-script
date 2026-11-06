@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.5-growth-and-reinforcement"
+local VERSION="3.6-structure-tables"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -145,7 +145,7 @@ local function refresh_toggles()
   item.button.Text=item.name..": "..(options[key] and "AAN" or "UIT")
   item.button.BackgroundColor3=options[key] and Color3.fromRGB(30,125,80) or Color3.fromRGB(35,80,145)
  end
- title.Text="FRONT PANEL 3.5 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
+ title.Text="FRONT PANEL 3.6 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
 local function halt(reason)
  for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams","reinforce"}) do options[key]=false end
@@ -349,7 +349,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.5")
+]=],snapshot,RAW_URL.."?v=3.6")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -417,17 +417,65 @@ local function message_table(kind,payload)
     end
     return nil
 end
-local function message_issue(kind,payload,critical)
+local function structure_list(payload)
+    if type(payload)~="table" then return nil,"verwacht gebouwtabel" end
+    local root=payload
+    if root.tile~=nil then root={root}
+    else
+        for _,key in ipairs({"structures","entries","events","list"}) do
+            if type(root[key])=="table" then root=root[key];break end
+        end
+    end
+    local result={}
+    for key,entry in pairs(root) do
+        if type(entry)~="table" then return nil,"record "..tostring(key).." is "..typeof(entry)..", geen gebouwrecord" end
+        local tile=tonumber(entry.tile)
+        local owner=tonumber(entry.ownerId)
+        local level=tonumber(entry.level)
+        if owner==0 and entry.level==nil then level=0 end
+        local kind=entry.kind==nil and 1 or tonumber(entry.kind)
+        local function integer(value) return type(value)=="number" and value==value and value%1==0 end
+        if not integer(tile) or tile<0 or tile>=N then
+            return nil,"record "..tostring(key)..": tile="..tostring(entry.tile).." ("..typeof(entry.tile).."), kaart N="..tostring(N)
+        end
+        if not integer(owner) or owner<0 or owner>255 then return nil,"record "..tostring(key)..": ownerId="..tostring(entry.ownerId).." ("..typeof(entry.ownerId)..")" end
+        if not integer(level) or level<0 then return nil,"record "..tostring(key)..": level="..tostring(entry.level).." ("..typeof(entry.level)..")" end
+        if not integer(kind) or kind<1 then return nil,"record "..tostring(key)..": kind="..tostring(entry.kind).." ("..typeof(entry.kind)..")" end
+        local copy=table.clone(entry)
+        copy.tile=tile;copy.ownerId=owner;copy.level=level;copy.kind=kind
+        result[#result+1]=copy
+    end
+    return result
+end
+local function structure_shape(payload)
+    if type(payload)~="table" then return "type="..typeof(payload) end
+    local fields={}
+    local record=nil
+    if payload.tile~=nil then record=payload end
+    for key,value in pairs(payload) do
+        if #fields<8 then fields[#fields+1]=tostring(key)..":"..typeof(value) end
+        if not record and type(value)=="table" then record=value end
+    end
+    local recordFields={}
+    for key,value in pairs(record or {}) do
+        if #recordFields>=10 then break end
+        recordFields[#recordFields+1]=tostring(key)..":"..typeof(value)
+    end
+    return "root={"..table.concat(fields,",").."}; eerste record={"..table.concat(recordFields,",").."}"
+end
+local function message_issue(kind,payload,critical,detail)
     state.protocolWarnings=state.protocolWarnings or {}
     state.protocolBlocks=state.protocolBlocks or {}
     state.protocolWarningTypes=state.protocolWarningTypes or {}
     local size=typeof(payload)=="buffer" and (", "..buffer.len(payload).." bytes") or ""
     local message=kind..": ontvangen "..typeof(payload)..size.."; geen compatibele lijstdecoder"
+    if detail then message=message.." | "..detail end
     local changed=state.protocolWarningTypes[kind]~=typeof(payload)
     if changed then
         state.protocolWarningTypes[kind]=typeof(payload)
         state.protocolWarnings[kind]=message
         log("BERICHTFORMAAT: "..message)
+        if kind=="structs" then log("GEBOUWDETAILS: "..structure_shape(payload)) end
         if not state.decoderNamesLogged then
             local names={}
             for name,fn in pairs(Net or {}) do
@@ -446,6 +494,11 @@ local function message_issue(kind,payload,critical)
 end
 local function message_list(kind,payload,critical)
     local list=message_table(kind,payload)
+    if kind=="structs" then
+        local normalized,reason=structure_list(list)
+        if not normalized then message_issue(kind,payload,critical,reason);return nil end
+        list=normalized
+    end
     if not valid_list(kind,list) then message_issue(kind,payload,critical);return nil end
     if state.protocolWarnings then state.protocolWarnings[kind]=nil end
     if state.protocolWarningTypes then state.protocolWarningTypes[kind]=nil end
