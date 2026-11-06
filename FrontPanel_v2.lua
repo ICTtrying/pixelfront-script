@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="4.4-defense-and-harvest"
+local VERSION="4.5-strategic-nukes"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- protect=true,cities=true,posts=true,nukes=false,upgradeCities=true,
+ protect=true,cities=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  growthAware=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -242,7 +242,8 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Bescherm tegen buren","protect")
  toggle("Oorlog","Steden bouwen","cities")
  toggle("Oorlog","Grensposten bouwen","posts")
- toggle("Oorlog","Nuke op vijandelijk cluster","nukes")
+ toggle("Oorlog","Strategische atoomnukes","nukes")
+ toggle("Oorlog","Nuke op sterkere huizeneconomie","preemptNukes")
  toggle("Oorlog","Rivieren en zee oversteken","rivers")
  toggle("Oorlog","Anti-nuke bij steden","sams")
  toggle("Oorlog","Botlanden met steden eerst","botCities")
@@ -250,7 +251,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Groeicurve benutten","growthAware")
  toggle("Oorlog","Lopende fronten versterken","reinforce")
  toggle("Oorlog","Reinforcement met goud kopen","buyReinforcements")
- label("Oorlog","Nukes: alleen atoomwapens, alleen tegen een actief front, met meerdere steden binnen de zekere binnenradius. Geen eigen of geallieerde grond binnen de buitenradius. Beschikbare tokens en goud bepalen of een order mogelijk is.",160)
+ label("Oorlog","Atoomnukes: vijandelijke huizenclusters of een veilige vijandelijke zone achter een actieve aanval. Economische eerste aanval alleen tegen een nabije rivaal met betere huizeneconomie. Geen bekende SAM-dekking of eigen/geallieerde grond binnen de explosie. Goud, tokens en spelregels blijven bepalend.",160)
  toggle("Instellen","Observatiemodus","dry")
  button("Instellen","Echte acties aanzetten",function()
   options.dry=false;refresh_toggles();save_settings();log("ACTIEF: ingeschakelde functies voeren echte orders uit.")
@@ -351,7 +352,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=4.4")
+]=],snapshot,RAW_URL.."?v=4.5")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -770,7 +771,10 @@ function Strategy.breakout_ratio(id,covered,support)
         if front.id~=id and front.id~=0 then return nil end
         if front.id==id then deployed+=front.troops end
     end
-    if me.troops+deployed*0.60<enemy.troops*1.15 then return nil end
+    local _,myCities=Strategy.city_value(state.id)
+    local _,theirCities=Strategy.city_value(id)
+    local advantage=enemy.isBot~=true and theirCities>myCities+1 and 1.35 or 1.15
+    if me.troops+deployed*0.60<enemy.troops*advantage then return nil end
     local strongest,total=0,0
     for other,c in pairs(Strategy.contacts()) do
         if other~=id then
@@ -1090,7 +1094,7 @@ function Strategy.build_spot(kind)
     end
     return best
 end
-function Strategy.cluster_candidate()
+function Strategy.cluster_candidate(strategic)
     if not state.structuresReady or not Nukes then return nil end
     local mag=Nukes.magnitude(13)
     if not mag then return nil end
@@ -1100,7 +1104,19 @@ function Strategy.cluster_candidate()
     local cities={}
     local me=state.players[state.id]
     local attackers={}
-    for _,a in ipairs(state.incoming) do attackers[a.id]=true end
+    for _,a in ipairs(state.incoming) do attackers[a.id]=(attackers[a.id] or 0)+a.troops end
+    local economicTargets={}
+    if strategic and options.preemptNukes and options.attack and me and #state.incoming==0 and #state.outgoing==0 then
+        local _,myValue=Strategy.city_value(state.id)
+        for id in pairs(Strategy.contacts()) do
+            local enemy=state.players[id]
+            local _,value=Strategy.city_value(id)
+            if enemy and enemy.alive and enemy.isBot~=true and not friendly(id) and enemy.troops>=me.troops*0.60
+                and enemy.troops<=me.troops*1.60 and value>myValue+1 then
+                atWar[id]=true;economicTargets[id]=true
+            end
+        end
+    end
     for _,s in pairs(state.structures) do
         local enemy=state.players[s.ownerId]
         local captureInstead=options.preserveBotCities and enemy and enemy.isBot==true and me
@@ -1135,11 +1151,41 @@ function Strategy.cluster_candidate()
                     elseif d<=mag.outer then score=score+0.5*(s.level or 1) end
                 end
             end
-            if count>=options.minCluster then table.insert(ranked,{tile=tile,count=count,score=score}) end
+            if count>=options.minCluster then table.insert(ranked,{tile=tile,count=count,score=score*10,reason=economicTargets[owner] and "huizenvoorsprong van nabije rivaal verminderen" or "vijandelijk huizencluster uitschakelen"}) end
+        end
+    end
+    if strategic and options.defend and me then
+        local seen={}
+        for id,contact in pairs(Strategy.contacts()) do
+            if (attackers[id] or 0)>=me.troops*0.15 then
+                for i=1,math.min(8,#contact.points) do
+                    local point=contact.points[i]
+                    local px,py=point%W,math.floor(point/W)
+                    local inset=math.ceil(mag.outer)+4
+                    for _,direction in ipairs({{1,0},{-1,0},{0,1},{0,-1},{1,1},{-1,1},{1,-1},{-1,-1}}) do
+                        local x,y=px+direction[1]*inset,py+direction[2]*inset
+                        if x>=0 and x<W and y>=0 and y<H then
+                            local tile=y*W+x
+                            if not seen[tile] and buffer.readu8(state.owners,tile)==id and passable(tile) then
+                                seen[tile]=true
+                                local hit=0
+                                for dy=-mag.inner,mag.inner,3 do for dx=-mag.inner,mag.inner,3 do
+                                    local sx,sy=x+dx,y+dy
+                                    if dx*dx+dy*dy<=mag.inner*mag.inner and sx>=0 and sx<W and sy>=0 and sy<H
+                                        and buffer.readu8(state.owners,sy*W+sx)==id then hit+=1 end
+                                end end
+                                if hit>=20 then
+                                    ranked[#ranked+1]={tile=tile,count=0,score=70+hit+(attackers[id]/math.max(1,me.troops))*30,reason="vijandelijke aanvalszone ontregelen"}
+                                end
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
     table.sort(ranked,function(a,b) return a.score>b.score end)
-    for i=1,math.min(12,#ranked) do
+    for i=1,math.min(48,#ranked) do
         local candidate=ranked[i]
         local tile=candidate.tile
         local clear=true
@@ -1188,19 +1234,23 @@ local function send(payload,description)
     return true
 end
 function Strategy.try_nuke()
-    if not options.nukes or os.clock()-(state.lastNuke or -10000)<options.nukeDelay then return false end
+    if not options.nukes then return false end
+    if os.clock()-(state.lastNuke or -10000)<options.nukeDelay then state.nukeReason="Wachten op nuke-interval";return false end
     if not state.structuresReady or not state.gold then return false end
     local free=(state.freeNukes or 0)>0
-    if not free and state.gold-(Config.ATOM_BOMB_COST or 750000)<options.goldReserve then return false end
+    if not free and state.gold-(Config.ATOM_BOMB_COST or 750000)<options.goldReserve then
+        state.nukeReason="Onvoldoende nuke-budget: prijs "..tostring(Config.ATOM_BOMB_COST or 750000).." plus reserve "..options.goldReserve
+        return false
+    end
     if Config.NUKE_REQUIRES_SILO~=false then
         state.nukeReason="Nukeplanner wacht op ondersteunde siloregels";return false
     end
     if os.clock()-(state.lastNukeScan or -10000)<8 then return false end
     state.lastNukeScan=os.clock()
-    local candidate=Strategy.cluster_candidate()
-    if not candidate then state.nukeReason="Geen vrij cluster zonder geallieerde schade of SAM-dekking";return false end
-    if send({t="nuke",tile=candidate.tile,kind=13},"atoomnuke op "..candidate.count.." geconcentreerde steden") then
-        state.lastNuke=os.clock();state.lastSend=os.clock()
+    local candidate=Strategy.cluster_candidate(true)
+    if not candidate then state.nukeReason="Geen waardevol vrij doel zonder eigen/geallieerde schade of bekende SAM-dekking";return false end
+    if send({t="nuke",tile=candidate.tile,kind=13},"STRATEGISCHE NUKE: "..(candidate.reason or "vijandelijk cluster").." | huizen "..candidate.count) then
+        state.lastNuke=os.clock();state.lastSend=os.clock();state.nukeReason="Verstuurd: "..(candidate.reason or "cluster")
         table.insert(state.plannedBlasts,{tile=candidate.tile,untilTime=os.clock()+180})
     end
     return true
@@ -1759,7 +1809,7 @@ local function run_step()
         (tostring(state.requiredReserve or "?").." / "..tostring(state.economicReserve or "?")),tostring(state.gold or "?"),
         state.economicStatus or "nog geen betrouwbare beoordeling",
         state.measuredGrowth and string.format("%.1f",state.measuredGrowth) or "meten",
-        #warnings>0 and table.concat(warnings,", ") or "geen",state.reason or "Initialiseren")
+        #warnings>0 and table.concat(warnings,", ") or "geen",(state.reason or "Initialiseren")..(options.nukes and ("\nNukes: "..(state.nukeReason or "doelen beoordelen")) or "\nNukes: UIT"))
     if state.engineFault then
         state.reason="Gepauzeerd na fout; instellingen behouden. Gebruik Synchroniseer opnieuw."
         status.Text=state.engineFault
@@ -1830,8 +1880,8 @@ local function run_step()
     if #state.incoming>0 then
         state.reason="VERDEDIGEN: nieuwe aanvallen en frontversterkingen gepauzeerd"
         if defending and Strategy.try_buy_reinforcements() then return end
-        if Strategy.try_build(true) then return end
         if Strategy.try_nuke() then return end
+        if Strategy.try_build(true) then return end
         if options.defend then
             local worst=nil
             for _,attack in ipairs(state.incoming) do
