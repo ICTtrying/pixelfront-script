@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.0-strategy"
+local VERSION="3.1-delta-recovery"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -142,7 +142,7 @@ local function refresh_toggles()
   item.button.Text=item.name..": "..(options[key] and "AAN" or "UIT")
   item.button.BackgroundColor3=options[key] and Color3.fromRGB(30,125,80) or Color3.fromRGB(35,80,145)
  end
- title.Text="FRONT PANEL 3.0 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
+ title.Text="FRONT PANEL 3.1 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
 local function halt(reason)
  for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes"}) do options[key]=false end
@@ -158,7 +158,12 @@ local function guard(fn)
  return function(...)
   if not alive then return end
   local ok,err=xpcall(fn,debug.traceback,...)
-  if not ok then halt("FOUT: "..tostring(err)) end
+  if not ok then
+   local message=tostring(err)
+   if state.engineFault~=message then log("FOUT (acties gepauzeerd, instellingen behouden): "..message) end
+   state.engineFault=message;state.ready=false
+   if status then status.Text="ACTIES GEPAUZEERD\n"..message.."\nInstellingen blijven aan. Gebruik Synchroniseer opnieuw." end
+  end
  end
 end
 local function connect(signal,fn)
@@ -329,7 +334,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.0")
+]=],snapshot,RAW_URL.."?v=3.1")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -345,6 +350,55 @@ end
 local Config,Net,MapGen,Matchmaker,Scenarios,Nukes,folder
 local W,H,N
 local Strategy={}
+local function pause_map(reason)
+    if not state.awaitingInit then
+        state.generation=state.generation+1
+        state.ready=false;state.snapshotReady=false;state.indexing=false
+        state.pending={};state.awaitingInit=true
+        state.mapFault=tostring(reason)
+        log("KAART GEPAUZEERD: "..state.mapFault)
+        log("Geen spelorders; schakelaars en opgeslagen instellingen blijven behouden.")
+    end
+    return false
+end
+local function decode_delta(data)
+    assert(typeof(data)=="buffer","Delta is geen buffer maar "..typeof(data))
+    local length=buffer.len(data)
+    assert(length>=2,"Delta mist groepsheader")
+    local offset=2
+    local groups=buffer.readu16(data,0)
+    assert(groups<=256,"Onverwacht aantal groepen: "..groups)
+    local changes={}
+    local pairCount=0
+    local function read_byte()
+        assert(offset<length,"Afgekapt deltapakket op byte "..offset)
+        local value=buffer.readu8(data,offset);offset=offset+1
+        return value
+    end
+    for _=1,groups do
+        local owner=read_byte()
+        local low,high=read_byte(),read_byte()
+        local count=low+high*256
+        pairCount=pairCount+count
+        assert(pairCount<=math.min(N*2,65536),"Te veel deltaparen: "..pairCount)
+        local tile=0
+        for _=1,count do
+            local value,factor,bytes=0,1,0
+            while true do
+                local byte=read_byte();bytes=bytes+1
+                assert(bytes<=4,"Varint langer dan vier bytes")
+                value=value+(byte%128)*factor
+                if byte<128 then break end
+                factor=factor*128
+            end
+            tile=tile+value
+            assert(tile>=0 and tile<N,string.format("tegel=%s buiten kaart N=%s (%sx%s), pakket=%s bytes",tile,N,W,H,length))
+            changes[#changes+1]=tile;changes[#changes+1]=owner
+        end
+    end
+    assert(offset==length,"Ongelezen deltabytes: "..(length-offset))
+    return changes
+end
 local function load_module(shared,name)
     local m=shared:FindFirstChild(name)
     assert(m and m:IsA("ModuleScript"),"Ontbrekende module: "..name)
@@ -372,20 +426,31 @@ local function refresh_tile(tile)
     state.frontier[tile]=candidate or nil
 end
 local function apply_delta(data)
+    if state.awaitingInit then return false end
+    local ok,changes=pcall(decode_delta,data)
+    if not ok then
+        local prefix={}
+        if typeof(data)=="buffer" then
+            for i=0,math.min(buffer.len(data),16)-1 do prefix[#prefix+1]=string.format("%02x",buffer.readu8(data,i)) end
+        end
+        return pause_map(tostring(changes).." | header="..table.concat(prefix," "))
+    end
     local touched={}
-    Net.unpackDelta(data,function(tile,owner)
-        assert(tile>=0 and tile<N,"Kaartdelta buiten bereik")
+    for i=1,#changes,2 do
+        local tile,owner=changes[i],changes[i+1]
         buffer.writeu8(state.owners,tile,owner)
         if owner==state.id then Strategy.sample_owned(tile) end
         touched[tile]=true
         if owner~=0 and owner~=state.id then state.representatives[owner]=tile end
-    end)
+    end
     if state.terrain then
         for tile in pairs(touched) do
             refresh_tile(tile)
             neighbours(tile,refresh_tile)
         end
     end
+    state.lastGoodDelta=os.clock()
+    return true
 end
 local function index_map(generation)
     task.spawn(guard(function()
@@ -774,6 +839,8 @@ end
 local function state_event(kind,payload,extra)
     if kind=="init" then
         assert(type(payload)=="table" and type(payload.yourId)=="number","Onbekend init-formaat")
+        if state.round~=payload.round then state.resyncAttempts=0 end
+        state.awaitingInit=false;state.mapFault=nil;state.engineFault=nil
         state.generation=state.generation+1
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
@@ -814,7 +881,7 @@ local function state_event(kind,payload,extra)
                     buffer.copy(state.owners,0,state.snapshot)
                 else Net.unpackOwners(state.snapshot,state.owners) end
                 state.snapshotReady=true
-                for _,data in ipairs(state.pending) do apply_delta(data) end
+                for _,data in ipairs(state.pending) do if not apply_delta(data) then return end end
                 state.pending={}; state.snapshot=nil
                 finish_map()
             end
@@ -864,7 +931,10 @@ local function state_event(kind,payload,extra)
         local expected={gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true}
         if not expected[payload.reason] then state.errorCount=state.errorCount+1 end
         state.lastAction=os.clock()+5
-        if state.errorCount>=4 then halt("Vier weigeringen: automatisering gestopt. Stuur foutlog.") end
+        if state.errorCount>=4 then
+            state.engineFault="Vier onverwachte serverweigeringen; stuur Foutlog. Instellingen behouden."
+            log(state.engineFault)
+        end
     end
 end
 local function run_step()
@@ -877,7 +947,8 @@ local function run_step()
             log("Wedstrijdgegevens opnieuw opvragen ("..state.helloAttempts.."/3).")
         elseif not state.initTimeout then
             state.initTimeout=true
-            halt("Geen init ontvangen. Stuur dit foutlog; geen automatische spelorders gestart.")
+            state.engineFault="Geen init ontvangen. Stuur Foutlog; instellingen behouden."
+            log(state.engineFault)
         end
     end
     local me=state.players[state.id]
@@ -888,6 +959,23 @@ local function run_step()
         options.reload and (state.reloadStatus or "controleren") or "UIT",
         tostring(state.strongestNeighbour or "?"),tostring(state.neighbourCount or "?"),
         tostring(state.requiredReserve or "?"),tostring(state.gold or "?"),state.reason or "Initialiseren")
+    if state.engineFault then
+        state.reason="Gepauzeerd na fout; instellingen behouden. Gebruik Synchroniseer opnieuw."
+        return
+    end
+    if state.awaitingInit then
+        state.reason="Kaartupdate ongeldig; wachten op nieuwe volledige kaart"
+        if os.clock()-(state.helloAt or -100)>8 then
+            if (state.resyncAttempts or 0)<3 then
+                state.resyncAttempts=(state.resyncAttempts or 0)+1;state.helloAt=os.clock()
+                folder.Intent:FireServer({t="hello",tile=0})
+                log("Kaart opnieuw aanvragen "..state.resyncAttempts.."/3; functies blijven ingesteld.")
+            else
+                state.reason="Kaart niet hersteld na 3 pogingen; stuur Foutlog. Functies blijven ingesteld."
+            end
+        end
+        return
+    end
     if os.clock()-state.lastAction<options.interval then state.reason="Actievertraging";return end
     if role=="lobby" then
         if not options.queue then state.reason="Auto join staat uit";return end
@@ -1003,10 +1091,10 @@ task.spawn(guard(function()
     end
     connect(folder.State.OnClientEvent,state_event)
     connect(folder.Delta.OnClientEvent,function(data)
-        if not state.id then return end
+        if not state.id or state.awaitingInit then return end
         if state.snapshotReady then apply_delta(data)
         else
-            assert(#state.pending<100,"Snapshot blijft uit; delta-wachtrij vol")
+            if #state.pending>=100 then pause_map("Snapshot blijft uit; delta-wachtrij vol");return end
             table.insert(state.pending,data)
         end
     end)
@@ -1019,7 +1107,8 @@ task.spawn(guard(function()
     button("Overzicht","Synchroniseer opnieuw",function()
         if os.clock()-(state.helloAt or -100)<10 then return end
         if RS:GetAttribute(Matchmaker.ROLE_ATTR)=="match" then
-            halt("Opnieuw synchroniseren; schakel functies daarna weer aan.")
+            state.engineFault=nil;state.resyncAttempts=0
+            pause_map("Handmatige synchronisatie aangevraagd")
             state.helloAt=os.clock()
             folder.Intent:FireServer({t="hello",tile=0})
         end
