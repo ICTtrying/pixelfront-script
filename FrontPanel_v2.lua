@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.2-land-fronts"
+local VERSION="6.3-river-recovery"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -171,11 +171,20 @@ function Recorder.export()
    chunks[#chunks+1]=text
   end
  end
+ local gap=nil
+ if complete and Recorder.diskSeq and Recorder.seq>Recorder.diskSeq then
+  local firstMemory=Recorder.seq-(Recorder.tail-Recorder.head)
+  if firstMemory>Recorder.diskSeq+1 then gap={from=Recorder.diskSeq+1,to=firstMemory-1} end
+  for i=Recorder.head,Recorder.tail do
+   local sequence=firstMemory+i-Recorder.head
+   if sequence>Recorder.diskSeq then chunks[#chunks+1]=Recorder.ring[i] end
+  end
+ end
  local body=complete and table.concat(chunks) or Recorder.memory_text()
  local metadata={schema=1,session=Recorder.session,kind="export_manifest",version=VERSION,
   durationSeconds=os.clock()-Recorder.started,matchObserved=Recorder.matchObserved==true,lastPhase=state.phase,
-  lastSequence=Recorder.seq,lastDiskSequence=Recorder.diskSeq,parts=Recorder.part,partLimitReached=Recorder.diskCapped==true,
-  memoryDropped=Recorder.dropped,source=complete and "disk_parts" or "recent_memory",
+  lastSequence=Recorder.seq,lastDiskSequence=Recorder.diskSeq,missingSequenceRange=gap,parts=Recorder.part,partLimitReached=Recorder.diskCapped==true,
+  memoryDropped=Recorder.dropped,source=complete and ((Recorder.diskSeq and Recorder.seq>Recorder.diskSeq) and "disk_parts_and_recent_memory" or "disk_parts") or "recent_memory",
   firstRetainedMemorySequence=Recorder.seq-(Recorder.tail-Recorder.head),
   error=Recorder.error,samplingSeconds=2,fullMapRecorded=false,
   note="Client-visible observations; unknown and sampled data are not a complete server replay. Numeric dictionary keys are strings."}
@@ -215,6 +224,11 @@ function Recorder.receive(kind,payload,extra)
  end
  if kind=="init" then
   if Recorder.round~=payload.round then Recorder.roundStarted=now;Recorder.round=payload.round end
+ end
+ if kind=="structs" then return end
+ if kind=="portgold" or kind=="rails" or kind=="missiles" then
+  if now-(Recorder.lastByKind[kind] or -100)<5 then return end
+  Recorder.lastByKind[kind]=now
  end
  if kind=="players" or kind=="fronts" or kind=="armies" or kind=="vehicles" then
   if now-(Recorder.lastByKind[kind] or -100)<2 then return end
@@ -552,7 +566,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.2")
+]=],snapshot,RAW_URL.."?v=6.3")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -695,7 +709,7 @@ local function message_issue(kind,payload,critical,detail)
     elseif kind=="vehicles" then
         state.transportKnown=false
         if changed then
-            Recorder.emit("transport_degraded",{effect="water orders disabled; land fronts remain independent",landLimit=Config and Strategy.land_front_limit()})
+            Recorder.emit("transport_degraded",{effect="vehicle count unavailable; serialize water orders with server validation",landLimit=Config and Strategy.land_front_limit()})
             for _,name in ipairs(message_decoders.vehicles) do
                 if Net and type(Net[name])=="function" then
                     local ok,result=pcall(Net[name],payload)
@@ -1251,8 +1265,35 @@ function Strategy.water_targets()
     state.waterTargets=targets
     return targets
 end
+function Strategy.transport_available()
+    if not options.rivers then state.transportReason="Wateroversteken staat UIT";return false end
+    if os.clock()<(state.transportRetryAt or 0) then state.transportReason="Serverlimiet boten: wachten op herpoging";return false end
+    if Strategy.active_orders()>=Strategy.land_front_limit() then state.transportReason="Frontenlimiet: wachten op vrij front";return false end
+    if state.transportKnown~=false then
+        local available=(state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3)
+        state.transportReason=available and "Voertuigdata beschikbaar" or "Bekende transportlimiet bereikt"
+        return available
+    end
+    for _,entry in pairs(state.riverOrders or {}) do
+        if not entry.failed and entry.untilTime>os.clock() then
+            state.transportReason="Voertuigformaat onbekend: één oversteek loopt al";return false
+        end
+    end
+    if os.clock()-(state.lastFallbackTransport or -10000)<10 then state.transportReason="Gecontroleerde oversteek: kort bevestigingsinterval";return false end
+    state.transportReason="Voertuigformaat onbekend: één gecontroleerde oversteek, server controleert route en limieten"
+    return true
+end
+function Strategy.track_transport(id,tile)
+    state.riverOrders=state.riverOrders or {}
+    local distance=state.waterTargets and state.waterTargets[id] and state.waterTargets[id].distance or 0
+    state.riverOrders[id]={tile=tile,untilTime=os.clock()+math.max(60,math.min(180,distance*1.5))}
+    if state.transportKnown==false then
+        state.lastFallbackTransport=os.clock()
+        Recorder.emit("fallback_transport",{id=id,tile=tile,distance=distance,reason=state.transportReason})
+    end
+end
 function Strategy.active_orders()
-    local afloat=state.transportCount or 0
+    local afloat=state.transportKnown==false and 0 or (state.transportCount or 0)
     local pending=0
     for id,entry in pairs(state.riverOrders or {}) do
         if entry.untilTime<=os.clock() then state.riverOrders[id]=nil
@@ -1635,6 +1676,7 @@ function Strategy.order_ready(kind)
     return os.clock()-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
 end
 local function send(payload,description)
+    if payload.t=="attack" and state.blockedAttack and (state.blockedAttack[payload.tile] or 0)>os.clock() then return false end
     if payload.t=="attack" and state.owners and type(payload.tile)=="number"
         and payload.tile>=0 and payload.tile<buffer.len(state.owners) and buffer.readu8(state.owners,payload.tile)==state.id then
         Recorder.emit("order_revalidated",{payload=payload,reason="target already owned"})
@@ -1928,7 +1970,7 @@ local function enemy_targets()
     state.targetProtected={}
     for tile in pairs(state.frontier) do
         local id=buffer.readu8(state.owners,tile)
-        if id~=state.id and (id==0 or not friendly(id)) then
+        if id~=state.id and (id==0 or not friendly(id)) and (not state.blockedAttack or (state.blockedAttack[tile] or 0)<=os.clock()) then
             seen[id]=(seen[id] or 0)+1
             if seen[id]<=32 then
                 local covered=false
@@ -2162,7 +2204,7 @@ function Strategy.defense_harvest(targets,valuableOnly)
     for _,front in ipairs(state.incoming) do busy[front.id]=true end
     local candidates=table.clone(targets)
     local sea={}
-    if options.rivers and state.transportKnown~=false and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
+    if Strategy.transport_available() then
         for id,entry in pairs(state.waterTargets or {}) do
             local pending=state.riverOrders and state.riverOrders[id]
             if not candidates[id] and not busy[id] and buffer.readu8(state.owners,entry.tile)==id
@@ -2188,7 +2230,7 @@ function Strategy.defense_harvest(targets,valuableOnly)
         end
     end
     if best and send({t="attack",tile=candidates[best],ratio=bestRatio},"ACTIEVE VERDEDIGING: waardevol zwak land "..best..(sea[best] and " via water" or " via land").."; thuisreserve "..math.ceil(hold)) then
-        if sea[best] then state.riverOrders[best]={tile=candidates[best],untilTime=os.clock()+60} end
+        if sea[best] then Strategy.track_transport(best,candidates[best]) end
         state.lastSend=os.clock();return true
     end
     return false
@@ -2280,7 +2322,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
-        state.frontLimitDenied=nil
+        state.frontLimitDenied=nil;state.transportRetryAt=0;state.lastFallbackTransport=-10000;state.blockedAttack={}
         state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false;state.lastBorderAudit=-10000;state.lastTargetReport=-10000
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
@@ -2439,8 +2481,16 @@ local function state_event(kind,payload,extra)
             if payload.reason=="pass" then state.reinforceDenied=true;log("Reinforcement niet beschikbaar voor dit account.") end
             state.reinforceQuoteAt=nil
         end
+        if payload.reason=="own" and command and command.t=="attack" and command.tile then
+            state.blockedAttack=state.blockedAttack or {}
+            state.blockedAttack[command.tile]=os.clock()+5
+            state.lastWaterScan=-10000
+            if state.blockedLanding then state.blockedLanding[command.tile]=os.clock()+5 end
+            Recorder.emit("target_race",{tile=command.tile,reason="server reports own; await authoritative map"})
+        end
+        if payload.reason=="toomanytransportboats" then state.transportRetryAt=os.clock()+30 end
         if command and command.t=="build" and state.blockedBuild then state.blockedBuild[command.tile]=os.clock()+45 end
-        local expected={pass=true,gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true,
+        local expected={own=true,pass=true,gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true,
             busy=true,nobeach=true,nocoast=true,nosearoute=true,toomanytransportboats=true,toomanyfronts=true}
         if not expected[payload.reason] then state.errorCount=state.errorCount+1 end
         if payload.reason=="toomanyfronts" then
@@ -2727,7 +2777,7 @@ local function run_step_inner()
             end
         else state.boxedSince=nil end
         if not weakest then state.reason="Geen nieuw veilig landfront; wateroversteek onderzoeken" end
-        if options.rivers and state.transportKnown~=false and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
+        if Strategy.transport_available() then
             local targetId,target,waterScore,waterRatio,waterReserve=nil,nil,-math.huge,nil,nil
             for id,entry in pairs(state.waterTargets or {}) do
                 local enemy=state.players[id]
@@ -2747,7 +2797,7 @@ local function run_step_inner()
                 and me.troops-boatTroops>=(waterReserve or 0) then
                 if send({t="attack",tile=target.tile,ratio=waterRatio},"wateroversteek naar "..targetId.." | afstand "..target.distance.." | transport ongeveer "..boatTroops.." troepen") then
                     state.lastSend=os.clock()
-                    state.riverOrders[targetId]={tile=target.tile,untilTime=os.clock()+60}
+                    Strategy.track_transport(targetId,target.tile)
                 end
                 return
             end
@@ -2773,6 +2823,9 @@ local function run_step_inner()
         if not ratio and not economicRatio then
             state.reason="Reserve blokkeert order: leger "..math.floor(me.troops).." | strijd "..math.ceil(normalReserve or 0).." | groei "..math.ceil(economicReserve or 0)
             return
+        end
+        if options.rivers and next(state.waterTargets or {}) and not Strategy.transport_available() then
+            state.reason="Oversteek wacht: "..(state.transportReason or "transportvoorwaarden beoordelen");return
         end
         state.reason=state.island and ("Eiland: "..(state.waterSearchInfo or "zoekronde afwachten").."; geen betaalbare veilige landing") or state.pressureReason or "Geen betaalbaar veilig doel; wachten op troepen of beschikbare grens"
     else state.reason="Uitbreiden en aanvallen staan uit"
@@ -2867,7 +2920,7 @@ function Recorder.decisions()
   requiredReserve=state.requiredReserve,economicReserve=state.economicReserve,
   fronts=state.planFrontLimit or options.maxFronts,lastOrder=state.lastCommand,
   borderTargets=borders,waterTargets=state.waterTargets,transportCount=state.transportCount,
-  transportKnown=state.transportKnown,landFrontLimit=Config and Strategy.land_front_limit(),
+  transportKnown=state.transportKnown,transportReason=state.transportReason,transportRetryAt=state.transportRetryAt,landFrontLimit=Config and Strategy.land_front_limit(),
   pendingTransports=state.riverOrders,blockedLandings=state.blockedLanding,
   pendingBlasts=state.plannedBlasts,lastBuild=state.lastBuild,lastNuke=state.lastNuke,
   lastAction=state.lastAction,actionDelay=Config and Strategy.action_delay(),
