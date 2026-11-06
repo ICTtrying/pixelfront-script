@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="5.3-interleaved-planner"
+local VERSION="5.4-capacity-decisions"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -354,7 +354,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=5.3")
+]=],snapshot,RAW_URL.."?v=5.4")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -825,11 +825,11 @@ function Strategy.breakout_plan(targets)
     end
     return best,bestRatio,bestReserve
 end
-function Strategy.target_score(id,tile,distance)
+function Strategy.target_score(id,tile,distance,pressure)
     local me,enemy=state.players[state.id],state.players[id]
     if not me or not enemy or not enemy.alive or friendly(id) then return nil end
     if not options.attack and not (options.expand and enemy.isBot==true) then return nil end
-    if me.troops<enemy.troops*options.strength then return nil end
+    if not pressure and me.troops<enemy.troops*options.strength then return nil end
     local cities,value,complete=Strategy.city_value(id)
     local cityWeight=enemy.isBot==true and not options.botCities and 0.5 or 1
     local assets=(value*2000+complete*3000+cities*1000)*cityWeight
@@ -839,6 +839,53 @@ function Strategy.target_score(id,tile,distance)
     return reward-Strategy.nearby_danger(tile)*50-(distance or 0)*4
         +math.min(200,(state.planBorders and state.planBorders[id]) or 0)*2,
         cities,enemy.isBot==true
+end
+function Strategy.capacity_plan(targets)
+    local me=state.players[state.id]
+    state.pressureReason=nil
+    if not me or not options.attack or #state.incoming>0 then return nil end
+    local fill=me.troops/Strategy.capacity(me)
+    if fill<0.80 then return nil end
+    local busy={}
+    for _,front in ipairs(state.outgoing) do busy[front.id]=true end
+    if options.expand and targets[0] and not busy[0] then state.pressureReason="Hoge vulling: vrije grond heeft een beschikbare route";return nil end
+    local truce=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
+    if os.clock()-(state.playingAt or 0)<truce then state.pressureReason="Beginbescherming afwachten";return nil end
+    local limit=math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
+    local contacts=Strategy.contacts()
+    if options.protect and options.defend and (Config.MAX_FRONTS_PER_PLAYER or 4)>1 then
+        for id,c in pairs(contacts) do
+            if state.players[id] and state.players[id].isBot~=true and c.troops>=me.troops*0.60 then limit=math.min(limit,(Config.MAX_FRONTS_PER_PLAYER or 4)-1);break end
+        end
+    end
+    if Strategy.active_orders()>=limit then state.pressureReason="Fronten actief; defensief serverslot behouden";return nil end
+    local best,bestRatio,bestHold,bestScore=nil,nil,nil,-math.huge
+    local requiredLead=fill>=0.90 and 1.25 or 1.60
+    local considered=0
+    for id,tile in pairs(targets) do
+        local enemy=state.players[id]
+        if id~=0 and enemy and enemy.alive and not friendly(id) and not busy[id] then
+            considered+=1
+            if me.troops>=enemy.troops*requiredLead then
+                local top,total=0,0
+                for other,c in pairs(contacts) do
+                    if other~=id then local strength=c.troops*Strategy.threat_factor(other);top=math.max(top,strength);total+=strength end
+                end
+                local hold=math.max(me.troops*0.40,enemy.troops*0.50+top*0.45+total*0.10)
+                local needed=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*(state.targetProtected[id] and 1.1 or 0.60))
+                local ratio=nil
+                for _,preset in ipairs(Config.attackPresets(state.mode)) do
+                    local sent=math.floor(me.troops*preset)
+                    if preset<=0.50 and sent>=needed and me.troops-sent>=hold and (not ratio or preset<ratio) then ratio=preset end
+                end
+                local score=ratio and Strategy.target_score(id,tile,0,true)
+                if score and score>bestScore then best,bestRatio,bestHold,bestScore=id,ratio,hold,score end
+            end
+        end
+    end
+    if best then state.pressureReason=string.format("%.0f%% gevuld: berekende verovering van %s",fill*100,tostring(best))
+    else state.pressureReason="Hoge vulling: "..considered.." landdoelen beoordeeld; geen preset past bij overwicht en reserve voor andere buren" end
+    return best,bestRatio,bestHold
 end
 function Strategy.contacts()
     local context=state.planContext
@@ -2161,6 +2208,13 @@ local function run_step_inner()
     state.planBorders={}
     for id,contact in pairs(Strategy.contacts()) do state.planBorders[id]=contact.border end
     if Strategy.try_nuke() then return end
+    local pressureId,pressureRatio,pressureHold=Strategy.capacity_plan(targets)
+    if pressureId then
+        if send({t="attack",tile=targets[pressureId],ratio=pressureRatio},"CAPACITEITSKEUZE: "..state.pressureReason.." | thuisreserve "..math.ceil(pressureHold)) then
+            state.lastSend=os.clock();state.breakout={id=pressureId,untilTime=os.clock()+90}
+        end
+        return
+    end
     local parallelOpportunity=false
     if options.attack and #state.outgoing>0 then
         local busyTargets={}
@@ -2299,7 +2353,7 @@ local function run_step_inner()
             state.reason="Reserve blokkeert order: leger "..math.floor(me.troops).." | strijd "..math.ceil(normalReserve or 0).." | groei "..math.ceil(economicReserve or 0)
             return
         end
-        state.reason=state.island and ("Eiland: "..(state.waterSearchInfo or "zoekronde afwachten").."; geen betaalbare veilige landing") or "Geen betaalbaar veilig doel; wachten op troepen of beschikbare grens"
+        state.reason=state.island and ("Eiland: "..(state.waterSearchInfo or "zoekronde afwachten").."; geen betaalbare veilige landing") or state.pressureReason or "Geen betaalbaar veilig doel; wachten op troepen of beschikbare grens"
     else state.reason="Uitbreiden en aanvallen staan uit"
     end
 end
