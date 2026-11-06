@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.1-parallel-campaigns"
+local VERSION="6.2-land-fronts"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -122,10 +122,10 @@ function Recorder.emit(kind,data)
   for i=Recorder.head,Recorder.tail do compact[#compact+1]=Recorder.ring[i] end
   Recorder.ring=compact;Recorder.head=1;Recorder.tail=#compact
  end
- if Recorder.disk and Recorder.part<Recorder.maxParts then
+ if Recorder.disk and not Recorder.diskCapped then
   if Recorder.pendingBytes+#line>Recorder.maxPartBytes then Recorder.flush(true) end
-  if Recorder.disk and Recorder.part<Recorder.maxParts then
-   Recorder.pending[#Recorder.pending+1]=line;Recorder.pendingBytes+=#line
+  if Recorder.disk and not Recorder.diskCapped then
+   Recorder.pending[#Recorder.pending+1]=line;Recorder.pendingBytes+=#line;Recorder.pendingLastSeq=Recorder.seq
   end
  end
  return true
@@ -133,12 +133,21 @@ end
 function Recorder.flush(force)
  if not Recorder.disk or Recorder.pendingBytes==0 then return end
  if not force and os.clock()-Recorder.lastFlush<5 and Recorder.pendingBytes<128*1024 then return end
- if Recorder.part>=Recorder.maxParts then Recorder.error="Bestandslimiet bereikt; recent geheugen blijft beschikbaar";return end
- local path=Recorder.prefix..string.format("_part%03d.jsonl",Recorder.part+1)
- local ok,err=pcall(writefile,path,table.concat(Recorder.pending))
+ local pending=table.concat(Recorder.pending)
+ local current=Recorder.partText or ""
+ local reuse=Recorder.part>0 and #current+#pending<=Recorder.maxPartBytes
+ if not reuse and Recorder.part>=Recorder.maxParts then
+  Recorder.error="Bestandslimiet bereikt; recent geheugen blijft beschikbaar"
+  Recorder.diskCapped=true;Recorder.pending={};Recorder.pendingBytes=0;return
+ end
+ local part=reuse and Recorder.part or Recorder.part+1
+ local text=reuse and (current..pending) or pending
+ local path=Recorder.prefix..string.format("_part%03d.jsonl",part)
+ local ok,err=pcall(writefile,path,text)
  Recorder.lastFlush=os.clock()
  if not ok then Recorder.error="Opslaan: "..tostring(err);Recorder.disk=false;return end
- Recorder.part+=1;Recorder.parts[#Recorder.parts+1]=path
+ if not reuse then Recorder.parts[#Recorder.parts+1]=path end
+ Recorder.part=part;Recorder.partText=text;Recorder.diskSeq=Recorder.pendingLastSeq
  Recorder.pending={};Recorder.pendingBytes=0
  local manifest={schema=1,version=VERSION,session=Recorder.session,parts=Recorder.parts,
   latestSequence=Recorder.seq,memoryDropped=Recorder.dropped,partLimit=Recorder.maxParts,
@@ -165,7 +174,7 @@ function Recorder.export()
  local body=complete and table.concat(chunks) or Recorder.memory_text()
  local metadata={schema=1,session=Recorder.session,kind="export_manifest",version=VERSION,
   durationSeconds=os.clock()-Recorder.started,matchObserved=Recorder.matchObserved==true,lastPhase=state.phase,
-  lastSequence=Recorder.seq,parts=Recorder.part,partLimitReached=Recorder.part>=Recorder.maxParts,
+  lastSequence=Recorder.seq,lastDiskSequence=Recorder.diskSeq,parts=Recorder.part,partLimitReached=Recorder.diskCapped==true,
   memoryDropped=Recorder.dropped,source=complete and "disk_parts" or "recent_memory",
   firstRetainedMemorySequence=Recorder.seq-(Recorder.tail-Recorder.head),
   error=Recorder.error,samplingSeconds=2,fullMapRecorded=false,
@@ -178,7 +187,7 @@ function Recorder.export()
    local saved,fault=pcall(writefile,"frontpanel_latest_match.jsonl",text)
    if not saved then Recorder.error="Laatste wedstrijdkopie: "..tostring(fault) end
   end
-  if ok then return path,not Recorder.matchObserved and "Opgeslagen; deze opname bevat nog geen wedstrijd" or ((complete and Recorder.part<Recorder.maxParts) and "Opgeslagen" or "Gedeeltelijke tijdlijn; zie exportmetadata") end
+  if ok then return path,not Recorder.matchObserved and "Opgeslagen; deze opname bevat nog geen wedstrijd" or ((complete and not Recorder.diskCapped) and "Opgeslagen" or "Gedeeltelijke tijdlijn; zie exportmetadata") end
   Recorder.error=tostring(err)
  end
  if type(setclipboard)=="function" then
@@ -200,6 +209,10 @@ function Recorder.receive(kind,payload,extra)
  rate.count+=1
  if typeof(payload)=="buffer" then rate.bytes+=buffer.len(payload) end
  local now=os.clock()
+ if kind=="phase" and type(payload)=="table" then
+  if Recorder.receivedPhase==payload.phase and now-(Recorder.lastByKind.phase or -100)<5 then return end
+  Recorder.receivedPhase=payload.phase;Recorder.lastByKind.phase=now
+ end
  if kind=="init" then
   if Recorder.round~=payload.round then Recorder.roundStarted=now;Recorder.round=payload.round end
  end
@@ -539,7 +552,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.1")
+]=],snapshot,RAW_URL.."?v=6.2")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -679,7 +692,18 @@ local function message_issue(kind,payload,critical,detail)
     if kind=="structs" then
         state.structuresReady=false
         if changed then log("Gebouwafhankelijke orders wachten op betrouwbare gebouwgegevens.") end
-    elseif kind=="vehicles" then state.transportKnown=false end
+    elseif kind=="vehicles" then
+        state.transportKnown=false
+        if changed then
+            Recorder.emit("transport_degraded",{effect="water orders disabled; land fronts remain independent",landLimit=Config and Strategy.land_front_limit()})
+            for _,name in ipairs(message_decoders.vehicles) do
+                if Net and type(Net[name])=="function" then
+                    local ok,result=pcall(Net[name],payload)
+                    Recorder.emit("decoder_probe",{kind=kind,name=name,success=ok,result=result})
+                end
+            end
+        end
+    end
     if kind=="armies" then state.armies=nil end
 end
 local function message_list(kind,payload,critical)
@@ -1070,7 +1094,7 @@ function Strategy.capacity_plan(targets)
     if options.expand and targets[0] and not busy[0] then state.pressureReason="Hoge vulling: vrije grond heeft een beschikbare route";return nil end
     local truce=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
     if os.clock()-(state.playingAt or 0)<truce then state.pressureReason="Beginbescherming afwachten";return nil end
-    local limit=math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
+    local limit=Strategy.land_front_limit()
     local contacts=Strategy.contacts()
     if options.protect and options.defend and (Config.MAX_FRONTS_PER_PLAYER or 4)>1 then
         for id,c in pairs(contacts) do
@@ -1611,6 +1635,11 @@ function Strategy.order_ready(kind)
     return os.clock()-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
 end
 local function send(payload,description)
+    if payload.t=="attack" and state.owners and type(payload.tile)=="number"
+        and payload.tile>=0 and payload.tile<buffer.len(state.owners) and buffer.readu8(state.owners,payload.tile)==state.id then
+        Recorder.emit("order_revalidated",{payload=payload,reason="target already owned"})
+        return false
+    end
     if not Strategy.order_ready(payload.t) then
         if os.clock()-(Recorder.lastByKind.order_wait or -100)>=2 then
             Recorder.lastByKind.order_wait=os.clock()
@@ -1936,14 +1965,24 @@ function Strategy.finish_ratio(id,field,stalled)
  end
  return best,need,reserve
 end
+function Strategy.land_front_limit()
+ local serverSlots=Config.MAX_FRONTS_PER_PLAYER or 4
+ local limit=math.min(options.maxFronts,serverSlots)
+ if state.transportKnown==false and serverSlots>1 then limit=math.min(limit,serverSlots-1) end
+ local denied=state.frontLimitDenied
+ if denied and os.clock()<denied.retryAt and #state.outgoing>=denied.active then
+  limit=math.min(limit,denied.active)
+ elseif denied then state.frontLimitDenied=nil end
+ return limit
+end
 function Strategy.quick_campaign(targets)
  if not options.attack or #state.outgoing==0 or #state.incoming>0 or not fresh() then return false end
  local me=state.players[state.id]
- if not me or not me.alive or not state.ready or state.transportKnown==false then return false end
+ if not me or not me.alive or not state.ready then return false end
  if state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
  local grace=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
  if os.clock()-(state.playingAt or 0)<grace then return false end
- local slots=math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
+ local slots=Strategy.land_front_limit()
  if options.protect and options.defend and (Config.MAX_FRONTS_PER_PLAYER or 4)>1 then
   for id,contact in pairs(Strategy.contacts()) do
    if state.players[id] and state.players[id].isBot~=true and contact.troops>=me.troops*0.60 then
@@ -2241,6 +2280,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
+        state.frontLimitDenied=nil
         state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false;state.lastBorderAudit=-10000;state.lastTargetReport=-10000
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
@@ -2403,6 +2443,10 @@ local function state_event(kind,payload,extra)
         local expected={pass=true,gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true,
             busy=true,nobeach=true,nocoast=true,nosearoute=true,toomanytransportboats=true,toomanyfronts=true}
         if not expected[payload.reason] then state.errorCount=state.errorCount+1 end
+        if payload.reason=="toomanyfronts" then
+            state.frontLimitDenied={active=#state.outgoing,retryAt=os.clock()+10}
+            Recorder.emit("front_limit_denied",state.frontLimitDenied)
+        end
         state.lastAction=os.clock()+5
         if state.errorCount>=4 then
             state.engineFault="Vier onverwachte serverweigeringen; stuur Foutlog. Instellingen behouden."
@@ -2637,7 +2681,7 @@ local function run_step_inner()
     local openRatio,openReserve=Strategy.neutral_ratio(0,economicRatio,economicReserve)
     local openReady=Strategy.open_ready(openRatio,openReserve)
     local active=Strategy.active_orders()
-    local allowedFronts=state.transportKnown==false and 1 or options.maxFronts
+    local allowedFronts=Strategy.land_front_limit()
     local serverSlots=Config.MAX_FRONTS_PER_PLAYER or 4
     if options.protect and options.defend and serverSlots>1 then
         for id in pairs(state.planBorders or {}) do
@@ -2823,6 +2867,7 @@ function Recorder.decisions()
   requiredReserve=state.requiredReserve,economicReserve=state.economicReserve,
   fronts=state.planFrontLimit or options.maxFronts,lastOrder=state.lastCommand,
   borderTargets=borders,waterTargets=state.waterTargets,transportCount=state.transportCount,
+  transportKnown=state.transportKnown,landFrontLimit=Config and Strategy.land_front_limit(),
   pendingTransports=state.riverOrders,blockedLandings=state.blockedLanding,
   pendingBlasts=state.plannedBlasts,lastBuild=state.lastBuild,lastNuke=state.lastNuke,
   lastAction=state.lastAction,actionDelay=Config and Strategy.action_delay(),
