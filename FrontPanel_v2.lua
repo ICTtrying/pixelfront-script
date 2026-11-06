@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="4.0-breakout-strategy"
+local VERSION="4.1-adaptive-campaign"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -350,7 +350,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=4.0")
+]=],snapshot,RAW_URL.."?v=4.1")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -747,7 +747,8 @@ function Strategy.opportunity_ratio(id,covered)
     if enemy.isBot~=true and enemy.troops>me.troops*0.12 then
         for _,front in ipairs(state.outgoing) do
             local other=state.players[front.id]
-            if front.id~=id and other and other.isBot~=true and other.alive then return nil end
+            if front.id~=id and other and other.isBot~=true and other.alive
+                and other.troops+enemy.troops>me.troops*0.45 then return nil end
         end
     end
     if options.protect then required=math.max(required,Strategy.risk_reserve()) end
@@ -820,7 +821,8 @@ function Strategy.target_score(id,tile,distance)
     local exposed=enemy.isBot~=true and enemy.troops<=me.troops*0.12
     if exposed then priority=3.5 end
     return priority*100000+math.min(value,100)*100+math.min(complete,30)*50
-        -enemy.troops/math.max(1,me.troops)*200-Strategy.nearby_danger(tile)*50-(distance or 0)*4,
+        -enemy.troops/math.max(1,me.troops)*200-Strategy.nearby_danger(tile)*50-(distance or 0)*4
+        +math.min(200,(state.planBorders and state.planBorders[id]) or 0)*2,
         cities,enemy.isBot==true
 end
 function Strategy.contacts()
@@ -1347,6 +1349,10 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         local ratio=economic and economicRatio or normalRatio
         local tile=targets[id]
         local breakout=state.breakout and state.breakout.id==id and now<state.breakout.untilTime
+        local progress=state.frontProgress and state.frontProgress[id]
+        local stalled=enemy and progress and now-progress.at>=15
+        local fastFinish=enemy and enemy.alive and me.troops>=enemy.troops*8
+        if fastFinish then ratio=Strategy.opportunity_ratio(id,state.targetProtected[id]) end
         if breakout then ratio=Strategy.breakout_ratio(id,state.targetProtected[id],true) end
         if id==0 then
             tile=nil
@@ -1371,14 +1377,18 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         end
         local record=state.boosts[id] or {at=-10000,bursts=0,captureAt=-10000}
         if (state.lastCaptureAt or -10000)>record.captureAt then record.bursts=0 end
-        local eligible=id==0 or breakout or Strategy.target_score(id,tile or 0,0)~=nil
+        local eligible=id==0 or breakout or fastFinish or Strategy.target_score(id,tile or 0,0)~=nil
         if enabled and ratio and tile and eligible and not friendly(id)
-            and (not options.protect or not state.targetProtected[id] or breakout)
+            and (not options.protect or not state.targetProtected[id] or breakout or fastFinish)
             and now-record.at>=options.reinforceDelay and record.bursts<options.maxBoosts then
             local committed=math.floor(me.troops*ratio)
             local depleted=front.troops<committed*0.5
             local ready=not economic or economicReady or depleted
             local oversupplied=front.troops>committed*2 and me.troops/Strategy.capacity(me)<0.9
+            if fastFinish then
+                local speedNeed=enemy.troops*(Config.BUDGET_RATIO_MAX or 0.5)/math.max(0.001,2*(Config.SPEED_RATIO_DIV or 5))
+                oversupplied=front.troops>=math.max(Config.MIN_ATTACK_TROOPS or 250,speedNeed*1.5) and not stalled
+            end
             if ready and not oversupplied then
                 local score=(depleted and 1000 or 0)+(id~=0 and 100 or 0)-front.troops/math.max(1,committed)
                 if not best or score>best.score then best={id=id,tile=tile,ratio=ratio,record=record,score=score} end
@@ -1389,9 +1399,43 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
     if send({t="attack",tile=best.tile,ratio=best.ratio},"bestaand front "..best.id.." gericht versterken") then
         best.record.at=now;best.record.bursts=best.record.bursts+1
         best.record.captureAt=state.lastCaptureAt or -10000
+        if state.frontProgress and state.frontProgress[best.id] then state.frontProgress[best.id].at=now end
         state.boosts[best.id]=best.record;state.lastSend=now
     end
     return true
+end
+function Strategy.spawn_score(tile)
+    if not tile or tile<0 or tile>=N or not passable(tile) then return nil end
+    local owner=buffer.readu8(state.owners,tile)
+    if owner~=0 and owner~=state.id then return nil end
+    local x,y=tile%W,math.floor(tile/W)
+    local nearest,crowding=W+H,0
+    for id,other in pairs(state.representatives) do
+        if id~=state.id and buffer.readu8(state.owners,other)==id then
+            local distance=math.abs(x-other%W)+math.abs(y-math.floor(other/W))
+            nearest=math.min(nearest,distance)
+            local human=state.rosterUsers[id]~=nil or (state.players[id] and state.players[id].isBot~=true)
+            if distance<140 then crowding+=(140-distance)*(human and 2 or 0.6) end
+        end
+    end
+    if nearest<(Config.MIN_SPAWN_DISTANCE or 30)+10 then return nil end
+    local free,wide=0,0
+    for dy=-24,24,8 do for dx=-24,24,8 do
+        local px,py=x+dx,y+dy
+        if px>=0 and px<W and py>=0 and py<H then
+            local t=py*W+px;local id=buffer.readu8(state.owners,t)
+            if passable(t) and (id==0 or id==state.id) then free+=1 end
+        end
+    end end
+    for dy=-80,80,20 do for dx=-80,80,20 do
+        local px,py=x+dx,y+dy
+        if px>=0 and px<W and py>=0 and py<H then
+            local t=py*W+px
+            if passable(t) and buffer.readu8(state.owners,t)==0 then wide+=1 end
+        end
+    end end
+    if free<30 then return nil end
+    return free*12+wide*5+math.min(nearest,300)-crowding-bit32.band(buffer.readu8(state.terrain,tile),63)*2
 end
 local function choose_spawn()
     if state.historical then
@@ -1411,35 +1455,18 @@ local function choose_spawn()
         end
         return best
     end
-    local best,bestScore=nil,-math.huge
+    local best=state.spawnTile
+    local bestScore=Strategy.spawn_score(best) or -math.huge
     local rng=Random.new()
     for attempt=1,400 do
         local tile=rng:NextInteger(0,N-1)
-        if buffer.readu8(state.owners,tile)==0 and passable(tile) then
-            local x,y=tile%W,math.floor(tile/W)
-            local nearest=W+H
-            for id,other in pairs(state.representatives) do
-                if buffer.readu8(state.owners,other)==id then
-                    nearest=math.min(nearest,math.abs(x-other%W)+math.abs(y-math.floor(other/W)))
-                end
-            end
-            if nearest>=(Config.MIN_SPAWN_DISTANCE or 30)+10 then
-                local free=0
-                for dy=-24,24,8 do
-                    for dx=-24,24,8 do
-                        local px,py=x+dx,y+dy
-                        if px>=0 and px<W and py>=0 and py<H then
-                            local t=py*W+px
-                            if passable(t) and buffer.readu8(state.owners,t)==0 then free=free+1 end
-                        end
-                    end
-                end
-                local height=bit32.band(buffer.readu8(state.terrain,tile),63)
-                local score=free*12+math.min(nearest,300)-height*2
-                if free>=30 and score>bestScore then best,bestScore=tile,score end
-            end
-        end
+        local score=Strategy.spawn_score(tile)
+        if score and score>bestScore then best,bestScore=tile,score end
         if attempt%80==0 then task.wait() end
+    end
+    if state.spawnTile and best~=state.spawnTile then
+        local current=Strategy.spawn_score(state.spawnTile)
+        if current and bestScore-current<math.max(100,math.abs(current)*0.18) then return state.spawnTile end
     end
     return best
 end
@@ -1479,7 +1506,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
-        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil
+        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={}
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
@@ -1543,6 +1570,13 @@ local function state_event(kind,payload,extra)
         local players={}
         for _,entry in ipairs(payload) do players[entry.id]=entry end
         Strategy.observe_growth(state.players[state.id],players[state.id])
+        state.frontProgress=state.frontProgress or {}
+        for id,entry in pairs(players) do
+            local previous=state.players[id]
+            local progress=state.frontProgress[id] or {at=os.clock(),tiles=entry.tiles}
+            if previous and entry.tiles<previous.tiles then progress.at=os.clock() end
+            progress.tiles=entry.tiles;state.frontProgress[id]=progress
+        end
         state.players=players; state.lastPlayers=os.clock()
     elseif kind=="fronts" and state.id then
         assert(type(payload.out)=="table" and type(payload.inc)=="table","Onbekend fronts-formaat")
@@ -1597,7 +1631,10 @@ local function state_event(kind,payload,extra)
     elseif kind=="phase" then
         if state.phase~=payload.phase and payload.phase=="playing" then state.playingAt=os.clock() end
         state.phase=payload.phase
-    elseif kind=="spawned" then state.spawned=true;state.errorCount=0; log("Spawn bevestigd.")
+    elseif kind=="spawned" then
+        state.spawned=payload.preview~=true;state.previewChosen=payload.preview==true
+        state.spawnTile=payload.tile or state.pendingSpawn;state.pendingSpawn=nil;state.errorCount=0
+        log(state.previewChosen and "Voorlopige spawn bevestigd; omgeving blijft gecontroleerd." or "Spawn bevestigd.")
     elseif kind=="denied" then
         log("Server weigert: "..tostring(payload.reason))
         if state.phase=="spawn" and state.pendingSpawn then
@@ -1710,11 +1747,11 @@ local function run_step()
     if not state.id or state.id==0 then state.reason="Wachten op eigen identiteit van server";return end
     if not state.ready then state.reason="Kaart en eigenaars laden";return end
     if state.phase=="spawn" and options.spawn and not state.spawned then
-        if os.clock()-state.spawnAt<8 then state.reason="Wachten op spawnbevestiging";return end
+        if os.clock()-state.spawnAt<5 then state.reason="Wachten op spawnbevestiging";return end
         state.spawnAt=os.clock()
         local generation=state.generation
         local tile=choose_spawn()
-        if alive and state.generation==generation and state.phase=="spawn" and options.spawn and tile then
+        if alive and state.generation==generation and state.phase=="spawn" and options.spawn and tile and tile~=state.spawnTile then
             if send({t="spawn",tile=tile},state.historical and "groot beschikbaar land kiezen" or "spawn op tegel "..tile) then state.pendingSpawn=tile end
         elseif not tile then state.reason="Geen geschikte beschikbare spawn gevonden"
         end
@@ -1728,6 +1765,8 @@ local function run_step()
     if Strategy.try_buy_reinforcements() then return end
     local ratio=choose_ratio(#state.incoming>0)
     local targets=enemy_targets()
+    state.planBorders={}
+    for id,contact in pairs(Strategy.contacts()) do state.planBorders[id]=contact.border end
     if #state.incoming>0 then
         if options.defend then
             local worst=nil
@@ -1745,7 +1784,17 @@ local function run_step()
         return
     end
     if Strategy.try_nuke() then return end
-    if Strategy.try_build(false) then return end
+    local parallelOpportunity=false
+    if options.attack and #state.outgoing>0 then
+        local busyTargets={}
+        for _,front in ipairs(state.outgoing) do busyTargets[front.id]=true end
+        for id in pairs(targets) do
+            local enemy=state.players[id]
+            if id~=0 and not busyTargets[id] and enemy and enemy.troops<=me.troops*0.20
+                and Strategy.opportunity_ratio(id,state.targetProtected[id]) then parallelOpportunity=true;break end
+        end
+    end
+    if not parallelOpportunity and Strategy.try_build(false) then return end
     local normalReserve=state.requiredReserve
     local economicRatio=choose_ratio(false,true)
     local economicReserve=state.requiredReserve
@@ -1812,6 +1861,8 @@ local function run_step()
             local cityCount=Strategy.city_value(weakest)
             local bot=state.players[weakest].isBot==true
             local description=bot and ("botland "..weakest.." veroveren; "..cityCount.." zichtbare steden") or "voorzichtige aanval op speler/onbekend land "..weakest
+            state.reason="Plan: "..(active>0 and "parallel zwak buurland innemen" or "zwakke buur en huizen innemen")
+            log(state.reason.." | doel "..weakest.." | lopende fronten "..active)
             state.requiredReserve=math.ceil(bestReserve or normalReserve or 0)
             description=description.." | inzet "..math.floor(me.troops*bestRatio).." | thuis "..math.floor(me.troops*(1-bestRatio))
             if send({t="attack",tile=targets[weakest],ratio=bestRatio},description) then state.lastSend=os.clock() end
