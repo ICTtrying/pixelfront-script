@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.1-delta-recovery"
+local VERSION="3.2-rivers-and-sams"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -16,7 +16,8 @@ local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
  protect=true,cities=true,posts=true,nukes=false,upgradeCities=true,
- goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8}
+ goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
+ rivers=true,sams=true,maxFronts=3,riverRange=24,maxSams=4}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
 if type(getgenv)=="function" then
@@ -32,7 +33,7 @@ local function valid_settings(value)
  end
  for key,range in pairs({reserve={10,90},strength={1.2,10},interval={2,30},
   goldReserve={0,10000000},minCluster={2,12},nukeDelay={30,300},maxCities={1,40},
-  maxCityLevel={1,10},buildDelay={5,60}}) do
+  maxCityLevel={1,10},buildDelay={5,60},maxFronts={1,4},riverRange={4,48},maxSams={1,12}}) do
   local n=value[key]
   if type(n)=="number" and n==n and n>=range[1] and n<=range[2] then options[key]=n end
  end
@@ -142,10 +143,10 @@ local function refresh_toggles()
   item.button.Text=item.name..": "..(options[key] and "AAN" or "UIT")
   item.button.BackgroundColor3=options[key] and Color3.fromRGB(30,125,80) or Color3.fromRGB(35,80,145)
  end
- title.Text="FRONT PANEL 3.1 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
+ title.Text="FRONT PANEL 3.2 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
 local function halt(reason)
- for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes"}) do options[key]=false end
+ for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams"}) do options[key]=false end
  refresh_toggles()
  save_settings()
  state.reason=reason or "Gestopt"
@@ -240,6 +241,8 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Steden bouwen","cities")
  toggle("Oorlog","Grensposten bouwen","posts")
  toggle("Oorlog","Nuke op vijandelijk cluster","nukes")
+ toggle("Oorlog","Rivieren oversteken","rivers")
+ toggle("Oorlog","Anti-nuke bij steden","sams")
  label("Oorlog","Nukes: alleen atoomwapens, alleen tegen een actief front, met meerdere steden binnen de zekere binnenradius. Geen eigen of geallieerde grond binnen de buitenradius. Beschikbare tokens en goud bepalen of een order mogelijk is.",160)
  toggle("Instellen","Observatiemodus","dry")
  button("Instellen","Echte acties aanzetten",function()
@@ -255,6 +258,9 @@ local ui_ok,ui_error=xpcall(function()
  number_input("Instellen","Seconden tussen bouworders","buildDelay",5,60)
  number_input("Instellen","Minimale steden in nukecluster","minCluster",2,12)
  number_input("Instellen","Seconden tussen nukes","nukeDelay",30,300)
+ number_input("Instellen","Maximale actieve fronten incl. transport","maxFronts",1,4)
+ number_input("Instellen","Maximale waterzoekafstand in tegels","riverRange",4,48)
+ number_input("Instellen","Maximale anti-nuketorens","maxSams",1,12)
  button("Foutlog","Kopieer foutlog",function()
   if type(setclipboard)=="function" then setclipboard(table.concat(history,"\n"))
   else log("Geen klembordfunctie; maak een screenshot.") end
@@ -334,7 +340,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.1")
+]=],snapshot,RAW_URL.."?v=3.2")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -424,6 +430,14 @@ local function refresh_tile(tile)
         end)
     end
     state.frontier[tile]=candidate or nil
+    state.coast=state.coast or {}
+    local coast=false
+    if buffer.readu8(state.owners,tile)==state.id and passable(tile) then
+        neighbours(tile,function(other)
+            if not bit32.btest(buffer.readu8(state.terrain,other),128) then coast=true end
+        end)
+    end
+    state.coast[tile]=coast or nil
 end
 local function apply_delta(data)
     if state.awaitingInit then return false end
@@ -504,7 +518,107 @@ function Strategy.contacts()
             else local k=math.random(1,c.border);if k<=24 then c.points[k]=tile end end
         end
     end
+    for id,entry in pairs(state.waterTargets or {}) do
+        local other=state.players[id]
+        if id~=0 and other and other.alive and not friendly(id) and not contacts[id] then
+            contacts[id]={id=id,tile=entry.tile,border=1,troops=other.troops,points={entry.tile}}
+        end
+    end
     return contacts
+end
+function Strategy.water_targets()
+    if not options.rivers then state.waterTargets={};return state.waterTargets end
+    if os.clock()-(state.lastWaterScan or -10000)<6 then return state.waterTargets or {} end
+    state.lastWaterScan=os.clock()
+    local queue,depth,seen,targets={},{},{},{}
+    local function push(tile,d)
+        if not seen[tile] and #queue<12000 then
+            seen[tile]=true;queue[#queue+1]=tile;depth[#queue]=d
+        end
+    end
+    local origins=0
+    local shores={}
+    for tile in pairs(state.coast or {}) do
+        origins=origins+1
+        if #shores<256 then shores[#shores+1]=tile
+        else local k=math.random(1,origins);if k<=256 then shores[k]=tile end end
+    end
+    for _,tile in ipairs(shores) do
+        neighbours(tile,function(other)
+            if not bit32.btest(buffer.readu8(state.terrain,other),128) then push(other,1) end
+        end)
+    end
+    local head=1
+    while head<=#queue do
+        local tile,d=queue[head],depth[head];head=head+1
+        neighbours(tile,function(other)
+            if passable(other) then
+                local id=buffer.readu8(state.owners,other)
+                if id~=state.id and (id==0 or not friendly(id)) and (state.blockedLanding[other] or 0)<os.clock() then
+                    if not targets[id] or d<targets[id].distance then targets[id]={tile=other,distance=d} end
+                end
+            elseif d<options.riverRange and not bit32.btest(buffer.readu8(state.terrain,other),128) then
+                push(other,d+1)
+            end
+        end)
+    end
+    state.waterTargets=targets
+    return targets
+end
+function Strategy.active_orders()
+    local afloat=state.transportCount or 0
+    local pending=0
+    for id,entry in pairs(state.riverOrders or {}) do
+        if entry.untilTime<=os.clock() then state.riverOrders[id]=nil
+        elseif not entry.failed then pending=pending+1 end
+    end
+    return #state.outgoing+math.max(afloat,pending)
+end
+function Strategy.sam_spot()
+    local cities,sams,candidates={},{},{}
+    local coverage=Nukes and Nukes.samRange and Nukes.samRange(1) or 70
+    for _,s in pairs(state.structures) do
+        if s.ownerId==state.id then
+            if s.kind==1 then table.insert(cities,s)
+            elseif s.kind==5 then table.insert(sams,s) end
+        end
+    end
+    if #sams>=options.maxSams then return nil end
+    local important={}
+    for _,city in ipairs(cities) do
+        local covered=false
+        for _,sam in ipairs(sams) do
+            local r=Nukes and Nukes.samRange and Nukes.samRange(sam.level or 1) or coverage
+            if Strategy.distance(city.tile,sam.tile)<=r then covered=true;break end
+        end
+        if not covered then
+            table.insert(important,city)
+            local x,y=city.tile%W,math.floor(city.tile/W)
+            for _,offset in ipairs({{20,0},{-20,0},{0,20},{0,-20},{20,20},{-20,20},{20,-20},{-20,-20}}) do
+                local px,py=x+offset[1],y+offset[2]
+                if px>=0 and px<W and py>=0 and py<H then candidates[#candidates+1]=py*W+px end
+            end
+        end
+    end
+    for _,tile in pairs(state.ownedSamples or {}) do candidates[#candidates+1]=tile end
+    local best,bestScore=nil,0
+    for _,tile in ipairs(candidates) do
+        if buffer.readu8(state.owners,tile)==state.id and passable(tile) and (state.blockedBuild[tile] or 0)<os.clock() then
+            local clear=true
+            for _,s in pairs(state.structures) do
+                if Strategy.distance(tile,s.tile)<(Config.STRUCTURE_MIN_DIST or 15)+2 then clear=false;break end
+            end
+            if clear then
+                local value=0
+                for _,city in ipairs(important) do
+                    if Strategy.distance(tile,city.tile)<=coverage*0.85 then value=value+(city.level or 1)+2 end
+                end
+                local score=value-Strategy.nearby_danger(tile)*2
+                if value>0 and score>bestScore then best,bestScore=tile,score end
+            end
+        end
+    end
+    return best
 end
 function Strategy.risk_reserve()
     local top,second,count,total=0,0,0,0
@@ -723,6 +837,10 @@ function Strategy.try_build(defensive)
             if free or (cost and state.gold-cost>=options.goldReserve) then tile=Strategy.build_spot(3);kind=3 end
         end
     end
+    if not tile and options.sams then
+        free=(state.freeSams or 0)>0;cost=state.samCost;kind=5
+        if free or (cost and state.gold-cost>=options.goldReserve) then tile=Strategy.sam_spot() end
+    end
     if not tile and options.cities and not defensive then
         local cities={}
         for _,s in pairs(state.structures) do if s.ownerId==state.id and s.kind==1 then table.insert(cities,s) end end
@@ -739,7 +857,10 @@ function Strategy.try_build(defensive)
     end
     if not tile then return false end
     state.lastBuild=os.clock()
-    if send({t="build",tile=tile,kind=kind},kind==1 and "stad op veilige, verspreide locatie bouwen/upgraden" or "verdedigingspost bij bedreigde grens bouwen") then
+    local description=kind==1 and "stad op veilige, verspreide locatie bouwen/upgraden"
+        or kind==5 and "anti-nuketoren voor ongedekte belangrijke steden bouwen"
+        or "verdedigingspost bij bedreigde grens bouwen"
+    if send({t="build",tile=tile,kind=kind},description) then
         state.lastSend=os.clock();state.blockedBuild[tile]=os.clock()+30
     end
     return true
@@ -847,8 +968,9 @@ local function state_event(kind,payload,extra)
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
         state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil
         state.ownedSamples={};state.structures={};state.structuresReady=false
+        state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
         state.blockedBuild={};state.plannedBlasts={};state.gold=nil;state.cityCost=nil;state.postCost=nil
-        state.freeCities=0;state.freePosts=0;state.freeNukes=0
+        state.freeCities=0;state.freePosts=0;state.freeNukes=0;state.freeSams=0;state.samCost=nil
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
         for _,entry in ipairs(payload.roster or {}) do state.rosterUsers[entry.i]=entry.u end
@@ -896,12 +1018,21 @@ local function state_event(kind,payload,extra)
     elseif kind=="fronts" and state.id then
         assert(type(payload.out)=="table" and type(payload.inc)=="table","Onbekend fronts-formaat")
         state.incoming=payload.inc; state.outgoing=payload.out
+        for _,front in ipairs(state.outgoing) do
+            if state.riverOrders then state.riverOrders[front.id]=nil end
+        end
         state.levels=payload.levels or 0; state.lastFronts=os.clock()
         state.gold=payload.gold or state.gold;state.cityCost=payload.cost or state.cityCost
         state.postCost=payload.postCost or state.postCost
+        state.samCost=payload.samCost or state.samCost;state.freeSams=payload.freeSams or 0
         state.freeCities=payload.freeCities or 0;state.freePosts=payload.freePosts or 0;state.freeNukes=payload.freeNukes or 0
         state.allies={}
         for _,id in ipairs(payload.diplo and payload.diplo.allies or {}) do state.allies[id]=true end
+    elseif kind=="vehicles" and state.id then
+        state.transportCount=0
+        for _,v in ipairs(Net.unpackVehicles(payload)) do
+            if v.owner==state.id and v.kind==3 then state.transportCount=state.transportCount+1 end
+        end
     elseif kind=="structs" and state.id then
         if extra then state.structures={} end
         state.structures=state.structures or {}
@@ -913,7 +1044,8 @@ local function state_event(kind,payload,extra)
     elseif kind=="built" then
         state.errorCount=0;state.gold=payload.gold or state.gold
         if payload.kind==1 then state.cityCost=payload.cost or state.cityCost
-        elseif payload.kind==3 then state.postCost=payload.cost or state.postCost end
+        elseif payload.kind==3 then state.postCost=payload.cost or state.postCost
+        elseif payload.kind==5 then state.samCost=payload.cost or state.samCost end
         log("Bouw bevestigd op tegel "..tostring(payload.tile))
     elseif kind=="phase" then
         if state.phase~=payload.phase and payload.phase=="playing" then state.playingAt=os.clock() end
@@ -927,8 +1059,18 @@ local function state_event(kind,payload,extra)
             state.spawnAt=-100
         end
         local command=state.lastCommand
+        if command and command.t=="attack" and state.riverOrders then
+            for id,entry in pairs(state.riverOrders) do
+                if entry.tile==command.tile then
+                    local route=payload.reason=="nobeach" or payload.reason=="nocoast" or payload.reason=="nosearoute"
+                    entry.untilTime=os.clock()+(route and 30 or options.interval);entry.failed=true
+                    if route then state.blockedLanding[command.tile]=os.clock()+60;state.lastWaterScan=-10000 end
+                end
+            end
+        end
         if command and command.t=="build" and state.blockedBuild then state.blockedBuild[command.tile]=os.clock()+45 end
-        local expected={gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true}
+        local expected={gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true,
+            busy=true,nobeach=true,nocoast=true,nosearoute=true,toomanytransportboats=true,toomanyfronts=true}
         if not expected[payload.reason] then state.errorCount=state.errorCount+1 end
         state.lastAction=os.clock()+5
         if state.errorCount>=4 then
@@ -1018,6 +1160,7 @@ local function run_step()
     if not me or not me.alive or me.tiles<=0 then state.reason="Geen levend eigen rijk gevonden";return end
     if not fresh() then state.reason="Wachten op actuele troepen/fronten";return end
     if state.lastPlayers< (state.lastSend or -100) or state.lastFronts<(state.lastSend or -100) then state.reason="Wachten op server na order";return end
+    Strategy.water_targets()
     local ratio=choose_ratio(#state.incoming>0)
     local targets=enemy_targets()
     if #state.incoming>0 then
@@ -1039,8 +1182,13 @@ local function run_step()
     if Strategy.try_nuke() then return end
     if Strategy.try_build(false) then return end
     if not ratio then state.reason="Troepen bewaren: reserve of sterke buurlanden vereisen meer verdediging";return end
-    if #state.outgoing>0 then state.reason="Bestaande veldleger afwachten";return end
-    if options.expand and targets[0] then
+    local active=Strategy.active_orders()
+    if active>=math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4) then
+        state.reason="Frontenlimiet bereikt ("..active.."); bestaande legers/transporten afwachten";return
+    end
+    local busy={}
+    for _,front in ipairs(state.outgoing) do busy[front.id]=true end
+    if options.expand and targets[0] and not busy[0] then
         local tile=Strategy.open_tile()
         if tile and send({t="attack",tile=tile,ratio=ratio},"uitbreiden via minder bedreigde grens") then state.lastSend=os.clock() end
         return
@@ -1051,14 +1199,38 @@ local function run_step()
         local weakest=nil
         for id in pairs(targets) do
             local enemy=state.players[id]
-            if id~=0 and enemy and enemy.alive and (options.attack or enemy.isBot)
+            if id~=0 and not busy[id] and enemy and enemy.alive and (options.attack or enemy.isBot)
                 and (not options.protect or not state.targetProtected[id]) and me.troops>=enemy.troops*options.strength then
                 if not weakest or enemy.troops<state.players[weakest].troops then weakest=id end
             end
         end
         if weakest then
             if send({t="attack",tile=targets[weakest],ratio=ratio},"aanval op zwakkere buur "..weakest) then state.lastSend=os.clock() end
-        else state.reason="Geen zwakke aangrenzende vijand; bondgenoten overgeslagen" end
+            return
+        else state.reason="Geen nieuw veilig landfront; wateroversteek onderzoeken" end
+        if options.rivers and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
+            local targetId,target=nil,nil
+            for id,entry in pairs(state.waterTargets or {}) do
+                local enemy=state.players[id]
+                local allowed=(id==0 and options.expand) or (enemy and enemy.alive and (options.attack or enemy.isBot)
+                    and me.troops>=enemy.troops*options.strength)
+                local pending=state.riverOrders[id]
+                if allowed and not targets[id] and not busy[id] and not friendly(id)
+                    and (not pending or pending.untilTime<=os.clock()) then
+                    if not target or entry.distance<target.distance then targetId,target=id,entry end
+                end
+            end
+            local boatTroops=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
+            if target and boatTroops>=(Config.TRANSPORT_BOAT_MIN_TROOPS or 250)
+                and me.troops-boatTroops>=(state.requiredReserve or 0) then
+                if send({t="attack",tile=target.tile,ratio=ratio},"rivier/korte waterroute naar "..targetId.."; server kiest landbrug of transport") then
+                    state.lastSend=os.clock()
+                    state.riverOrders[targetId]={tile=target.tile,untilTime=os.clock()+60}
+                end
+                return
+            end
+            state.reason="Geen veilige beschikbare wateroversteek binnen zoekafstand"
+        end
     else state.reason="Uitbreiden en aanvallen staan uit"
     end
 end
