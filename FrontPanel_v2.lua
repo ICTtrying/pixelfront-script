@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="4.6-conquest-value"
+local VERSION="4.7-adaptive-tempo"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -18,7 +18,7 @@ local options={queue=false,spawn=false,expand=false,attack=false,defend=false,le
  protect=true,cities=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
- growthAware=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
+ growthAware=true,adaptiveTempo=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
 if type(getgenv)=="function" then
@@ -249,6 +249,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Botlanden met steden eerst","botCities")
  toggle("Oorlog","Huizen van zwakke landen heel houden","preserveBotCities")
  toggle("Oorlog","Groeicurve benutten","growthAware")
+ toggle("Oorlog","Adaptief uitbreidingstempo","adaptiveTempo")
  toggle("Oorlog","Lopende fronten versterken","reinforce")
  toggle("Oorlog","Reinforcement met goud kopen","buyReinforcements")
  label("Oorlog","Atoomnukes: vijandelijke huizenclusters of een veilige vijandelijke zone achter een actieve aanval. Economische eerste aanval alleen tegen een nabije rivaal met betere huizeneconomie. Geen bekende SAM-dekking of eigen/geallieerde grond binnen de explosie. Goud, tokens en spelregels blijven bepalend.",160)
@@ -352,7 +353,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=4.6")
+]=],snapshot,RAW_URL.."?v=4.7")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1220,7 +1221,23 @@ function Strategy.cluster_candidate(strategic)
     return nil
 end
 function Strategy.action_delay()
-    return options.defend and #state.incoming>0 and math.min(options.interval,1) or options.interval
+    if options.defend and #state.incoming>0 then return math.min(options.interval,1) end
+    if not options.adaptiveTempo or state.phase~="playing" or #state.incoming>0 then return options.interval end
+    local me=state.players[state.id]
+    if not me or not me.alive or not state.ready then return options.interval end
+    local fill=me.troops/Strategy.capacity(me)
+    local growth=state.territoryGrowth or {}
+    local myRate=growth[state.id] or 0
+    local racing=false
+    for id in pairs(state.planBorders or {}) do
+        local enemy=state.players[id]
+        if enemy and enemy.alive and enemy.isBot~=true and not friendly(id)
+            and enemy.troops>=me.troops*0.60 and (growth[id] or 0)>myRate*1.2+1 then racing=true;break end
+    end
+    state.racePressure=racing
+    if fill>=0.70 or (racing and fill>=0.45) then return math.min(options.interval,1) end
+    if fill>=0.45 then return math.min(options.interval,1.5) end
+    return options.interval
 end
 local function send(payload,description)
     if os.clock()-state.lastAction<Strategy.action_delay() then return false end
@@ -1505,11 +1522,14 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         local eligible=id==0 or breakout or fastFinish or Strategy.target_score(id,tile or 0,0)~=nil
         if enabled and ratio and tile and eligible and not friendly(id)
             and (not options.protect or not state.targetProtected[id] or breakout or fastFinish)
-            and now-record.at>=options.reinforceDelay and record.bursts<options.maxBoosts then
+            and now-record.at>=(options.adaptiveTempo and me.troops>=Strategy.capacity(me)*0.70
+                and (id==0 or fastFinish) and math.min(options.reinforceDelay,2) or options.reinforceDelay)
+            and record.bursts<options.maxBoosts then
             local committed=math.floor(me.troops*ratio)
             local depleted=front.troops<committed*0.5
             local ready=not economic or economicReady or depleted
             local oversupplied=front.troops>committed*2 and me.troops/Strategy.capacity(me)<0.9
+            if id==0 and not depleted then oversupplied=true end
             if fastFinish then
                 local speedNeed=enemy.troops*(Config.BUDGET_RATIO_MAX or 0.5)/math.max(0.001,2*(Config.SPEED_RATIO_DIV or 5))
                 oversupplied=front.troops>=math.max(Config.MIN_ATTACK_TROOPS or 250,speedNeed*1.5) and not stalled
@@ -1631,7 +1651,7 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
-        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={}
+        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
@@ -1696,8 +1716,14 @@ local function state_event(kind,payload,extra)
         for _,entry in ipairs(payload) do players[entry.id]=entry end
         Strategy.observe_growth(state.players[state.id],players[state.id])
         state.frontProgress=state.frontProgress or {}
+        state.territoryGrowth=state.territoryGrowth or {}
+        local elapsed=os.clock()-(state.lastPlayers or 0)
         for id,entry in pairs(players) do
             local previous=state.players[id]
+            if previous and elapsed>=0.1 and elapsed<=5 then
+                local rate=math.max(0,entry.tiles-previous.tiles)/elapsed
+                state.territoryGrowth[id]=(state.territoryGrowth[id] or rate)*0.65+rate*0.35
+            end
             local progress=state.frontProgress[id] or {at=os.clock(),tiles=entry.tiles}
             if previous and entry.tiles<previous.tiles then progress.at=os.clock() end
             progress.tiles=entry.tiles;state.frontProgress[id]=progress
@@ -1886,7 +1912,7 @@ local function run_step()
     if not me or not me.alive or me.tiles<=0 then state.reason="Geen levend eigen rijk gevonden";return end
     if not fresh() then state.reason="Wachten op actuele troepen/fronten";return end
     local defending=options.defend and #state.incoming>0
-    if not defending and (state.lastPlayers<(state.lastSend or -100) or state.lastFronts<(state.lastSend or -100)) then state.reason="Wachten op server na order";return end
+    if not defending and (state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100)) then state.reason="Wachten op server na order";return end
     local targets=enemy_targets()
     if #state.incoming>0 then
         state.reason="VERDEDIGEN: nieuwe aanvallen en frontversterkingen gepauzeerd"
@@ -2030,7 +2056,7 @@ local function run_step()
             state.reason="Plan: "..(bot and "botland oogsten: land, gebouwen en serverbeloning" or (active>0 and "parallel zwak buurland innemen" or "zwakke buur en huizen innemen"))
             log(state.reason.." | doel "..weakest.." | lopende fronten "..active)
             state.requiredReserve=math.ceil(bestReserve or normalReserve or 0)
-            description=description.." | huizen "..cityCount.." | waarde "..math.floor(bestScore).." | inzet "..math.floor(me.troops*bestRatio).." | thuis "..math.floor(me.troops*(1-bestRatio))
+            description=description..(state.racePressure and " | groeirace" or "").." | huizen "..cityCount.." | waarde "..math.floor(bestScore).." | inzet "..math.floor(me.troops*bestRatio).." | thuis "..math.floor(me.troops*(1-bestRatio))
             if send({t="attack",tile=targets[weakest],ratio=bestRatio},description) then state.lastSend=os.clock() end
             return
         end
