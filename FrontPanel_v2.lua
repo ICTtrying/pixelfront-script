@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="5.1-efficient-planner"
+local VERSION="5.2-opportunity-defense"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -353,7 +353,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=5.1")
+]=],snapshot,RAW_URL.."?v=5.2")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -881,8 +881,17 @@ function Strategy.water_targets()
         if id==0 or not friendly(id) then landExit=true;break end
     end
     local island=not landExit
-    local searchRange=island and math.max(options.riverRange,options.seaRange) or options.riverRange
-    local searchBudget=island and math.min(N,100000) or 12000
+    local opportunitySea=false
+    local me=state.players[state.id]
+    if me and options.attack then
+        for id,enemy in pairs(state.players) do
+            if id~=state.id and enemy.alive and enemy.isBot~=true and not friendly(id)
+                and enemy.troops<=me.troops*0.10 and Strategy.city_value(id)>=3 then opportunitySea=true;break end
+        end
+    end
+    local extended=island or opportunitySea
+    local searchRange=extended and math.max(options.riverRange,options.seaRange) or options.riverRange
+    local searchBudget=extended and math.min(N,100000) or 12000
     state.island=island
     local queue,depth,seen,targets={},{},{},{}
     local candidateScores={}
@@ -1700,7 +1709,7 @@ function Strategy.spawn_score(tile)
     if free<30 then return nil end
     return free*12+wide*5+math.min(nearest,300)-crowding-bit32.band(buffer.readu8(state.terrain,tile),63)*2
 end
-function Strategy.defense_harvest(targets)
+function Strategy.defense_harvest(targets,valuableOnly)
     local hold,critical=Strategy.defense_budget()
     local me=state.players[state.id]
     if critical or not me or not options.defend then return false end
@@ -1709,22 +1718,34 @@ function Strategy.defense_harvest(targets)
     local busy={}
     for _,front in ipairs(state.outgoing) do busy[front.id]=true end
     for _,front in ipairs(state.incoming) do busy[front.id]=true end
+    local candidates=table.clone(targets)
+    local sea={}
+    if options.rivers and state.transportKnown~=false and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
+        for id,entry in pairs(state.waterTargets or {}) do
+            local pending=state.riverOrders and state.riverOrders[id]
+            if not candidates[id] and not busy[id] and buffer.readu8(state.owners,entry.tile)==id
+                and (not pending or pending.untilTime<=os.clock()) then candidates[id]=entry.tile;sea[id]=true end
+        end
+    end
     local best,bestRatio,bestScore=nil,nil,-math.huge
-    for id,tile in pairs(targets) do
+    for id,tile in pairs(candidates) do
         local enemy=state.players[id]
-        if enemy and enemy.isBot==true and (options.attack or options.expand) and not busy[id]
-            and enemy.troops<=me.troops*0.10 then
+        local valuable=enemy and enemy.isBot~=true and options.attack and Strategy.city_value(id)>=3
+        if enemy and ((enemy.isBot==true and (options.attack or options.expand) and not valuableOnly) or valuable)
+            and not busy[id] and enemy.troops<=me.troops*0.10 then
             local score=Strategy.target_score(id,tile,0)
             for _,ratio in ipairs(Config.attackPresets(state.mode)) do
-                local committed=math.floor(me.troops*ratio)
-                if score and committed>=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*1.1)
-                    and me.troops-committed>=hold and (not best or score>bestScore or (id==best and ratio<bestRatio)) then
+                local committed=math.floor(me.troops*(sea[id] and 1/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5) or ratio))
+                local cost=sea[id] and math.max(committed,math.floor(me.troops*ratio)) or committed
+                if score and committed>=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*(enemy.isBot==true and 1.1 or 1.5))
+                    and me.troops-cost>=hold and (not best or score>bestScore or (id==best and ratio<bestRatio)) then
                     best,bestRatio,bestScore=id,ratio,score
                 end
             end
         end
     end
-    if best and send({t="attack",tile=targets[best],ratio=bestRatio},"ACTIEVE VERDEDIGING: goedkoop botland "..best.." veroveren; thuisreserve "..math.ceil(hold)) then
+    if best and send({t="attack",tile=candidates[best],ratio=bestRatio},"ACTIEVE VERDEDIGING: waardevol zwak land "..best..(sea[best] and " via water" or " via land").."; thuisreserve "..math.ceil(hold)) then
+        if sea[best] then state.riverOrders[best]={tile=candidates[best],untilTime=os.clock()+60} end
         state.lastSend=os.clock();return true
     end
     return false
@@ -2078,6 +2099,7 @@ local function run_step_inner()
         state.counterReason=nil
         if defending and Strategy.try_buy_reinforcements() then return end
         if Strategy.try_nuke() then return end
+        if defending and Strategy.defense_harvest(targets,true) then return end
         if options.defend then
             local worst=nil
             for _,attack in ipairs(state.incoming) do
@@ -2205,7 +2227,7 @@ local function run_step_inner()
             for id,entry in pairs(state.waterTargets or {}) do
                 local enemy=state.players[id]
                 local economic=id==0 or (enemy and enemy.isBot==true)
-                local orderRatio=economic and economicRatio or ratio
+                local orderRatio=economic and economicRatio or Strategy.opportunity_ratio(id,false)
                 local score=id==0 and options.expand and ((entry.space or 0)-entry.distance*0.25) or Strategy.target_score(id,entry.tile,entry.distance)
                 local boat=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
                 local invasionSafe=id==0 or (enemy and boat>=enemy.troops*(enemy.isBot==true and 1.1 or 1.5))
