@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.2-rivers-and-sams"
+local VERSION="3.3-bot-economy"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -17,7 +17,7 @@ local options={queue=false,spawn=false,expand=false,attack=false,defend=false,le
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
  protect=true,cities=true,posts=true,nukes=false,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
- rivers=true,sams=true,maxFronts=3,riverRange=24,maxSams=4}
+ rivers=true,sams=true,maxFronts=3,riverRange=24,maxSams=4,botCities=true,preserveBotCities=true}
 local settings_path="frontpanel_"..tostring(player.UserId).."_settings.json"
 local env={}
 if type(getgenv)=="function" then
@@ -143,7 +143,7 @@ local function refresh_toggles()
   item.button.Text=item.name..": "..(options[key] and "AAN" or "UIT")
   item.button.BackgroundColor3=options[key] and Color3.fromRGB(30,125,80) or Color3.fromRGB(35,80,145)
  end
- title.Text="FRONT PANEL 3.2 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
+ title.Text="FRONT PANEL 3.3 | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
 local function halt(reason)
  for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams"}) do options[key]=false end
@@ -243,6 +243,8 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Nuke op vijandelijk cluster","nukes")
  toggle("Oorlog","Rivieren oversteken","rivers")
  toggle("Oorlog","Anti-nuke bij steden","sams")
+ toggle("Oorlog","Botlanden met steden eerst","botCities")
+ toggle("Oorlog","Zwakke botsteden heel houden","preserveBotCities")
  label("Oorlog","Nukes: alleen atoomwapens, alleen tegen een actief front, met meerdere steden binnen de zekere binnenradius. Geen eigen of geallieerde grond binnen de buitenradius. Beschikbare tokens en goud bepalen of een order mogelijk is.",160)
  toggle("Instellen","Observatiemodus","dry")
  button("Instellen","Echte acties aanzetten",function()
@@ -340,7 +342,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.2")
+]=],snapshot,RAW_URL.."?v=3.3")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -453,6 +455,7 @@ local function apply_delta(data)
     for i=1,#changes,2 do
         local tile,owner=changes[i],changes[i+1]
         buffer.writeu8(state.owners,tile,owner)
+        if state.structures and state.structures[tile] then state.cityCache=nil end
         if owner==state.id then Strategy.sample_owned(tile) end
         touched[tile]=true
         if owner~=0 and owner~=state.id then state.representatives[owner]=tile end
@@ -504,6 +507,42 @@ function Strategy.distance(a,b)
     local dx=a%W-b%W
     local dy=math.floor(a/W)-math.floor(b/W)
     return math.sqrt(dx*dx+dy*dy)
+end
+function Strategy.city_value(id)
+    if not state.cityCache or state.cityCacheOwners~=state.owners or state.cityCacheStructs~=state.structures
+        or os.clock()-(state.cityCacheAt or -100)>1 then
+        state.cityCache={};state.cityCacheAt=os.clock()
+        state.cityCacheOwners=state.owners;state.cityCacheStructs=state.structures
+        for _,s in pairs(state.structures or {}) do
+            if s.kind==1 and buffer.readu8(state.owners,s.tile)==s.ownerId then
+                local value=state.cityCache[s.ownerId] or {0,0,0}
+                value[1]=value[1]+1;value[2]=value[2]+(s.level or 1)*(s.uc and 0.5 or 1)
+                if not s.uc then value[3]=value[3]+1 end
+                state.cityCache[s.ownerId]=value
+            end
+        end
+    end
+    local value=state.cityCache[id]
+    if not value then return 0,0,0 end
+    return value[1],value[2],value[3]
+end
+function Strategy.threat_factor(id)
+    local other=state.players[id]
+    if not other or other.isBot~=true then return 1 end
+    local cities=Strategy.city_value(id)
+    return cities>0 and 0.45 or 0.20
+end
+function Strategy.target_score(id,tile,distance)
+    local me,enemy=state.players[state.id],state.players[id]
+    if not me or not enemy or not enemy.alive or friendly(id) then return nil end
+    if not options.attack and not (options.expand and enemy.isBot==true) then return nil end
+    if me.troops<enemy.troops*options.strength then return nil end
+    local cities,value,complete=Strategy.city_value(id)
+    local priority=enemy.isBot==true and 2 or 1
+    if enemy.isBot==true and options.botCities and cities>0 then priority=3 end
+    return priority*100000+math.min(value,100)*100+math.min(complete,30)*50
+        -enemy.troops/math.max(1,me.troops)*200-Strategy.nearby_danger(tile)*50-(distance or 0)*4,
+        cities,enemy.isBot==true
 end
 function Strategy.contacts()
     local contacts={}
@@ -621,16 +660,18 @@ function Strategy.sam_spot()
     return best
 end
 function Strategy.risk_reserve()
-    local top,second,count,total=0,0,0,0
-    for _,c in pairs(Strategy.contacts()) do
+    local top,second,count,total,rawTop=0,0,0,0,0
+    for id,c in pairs(Strategy.contacts()) do
+        local troops=c.troops*Strategy.threat_factor(id)
+        rawTop=math.max(rawTop,c.troops)
         count=count+1
-        total=total+c.troops
-        if c.troops>top then second,top=top,c.troops
-        elseif c.troops>second then second=c.troops end
+        total=total+troops
+        if troops>top then second,top=top,troops
+        elseif troops>second then second=troops end
     end
     local incoming=0
     for _,a in ipairs(state.incoming) do incoming=incoming+a.troops end
-    state.strongestNeighbour=top;state.neighbourCount=count
+    state.strongestNeighbour=rawTop;state.weightedThreat=top;state.neighbourCount=count
     return math.ceil(top*0.35+second*0.10+total*0.15+incoming*1.10)
 end
 function Strategy.sample_owned(tile)
@@ -649,7 +690,7 @@ function Strategy.nearby_danger(tile)
                 local id=buffer.readu8(state.owners,py*W+px)
                 if id~=0 and not friendly(id) then
                     local enemy=state.players[id]
-                    risk=risk+(enemy and math.min(5,enemy.troops/math.max(1,me.troops)) or 1)*(32-r)/16
+                    risk=risk+(enemy and math.min(5,enemy.troops/math.max(1,me.troops))*Strategy.threat_factor(id) or 1)*(32-r)/16
                 end
             end
         end
@@ -706,7 +747,7 @@ function Strategy.build_spot(kind)
                     for _,c in pairs(contacts) do
                         local attacking=false
                         for _,a in ipairs(state.incoming) do if a.id==c.id then attacking=true;break end end
-                        if attacking or c.troops>=(state.strongestNeighbour or 0)*0.7 then
+                        if attacking or c.troops*Strategy.threat_factor(c.id)>=(state.weightedThreat or 0)*0.7 then
                             for _,point in ipairs(c.points) do border=math.min(border,Strategy.distance(tile,point)) end
                         end
                     end
@@ -728,8 +769,14 @@ function Strategy.cluster_candidate()
     for _,a in ipairs(state.incoming) do if a.id~=0 then atWar[a.id]=true end end
     for _,a in ipairs(state.outgoing) do if a.id~=0 then atWar[a.id]=true end end
     local cities={}
+    local me=state.players[state.id]
+    local attackers={}
+    for _,a in ipairs(state.incoming) do attackers[a.id]=true end
     for _,s in pairs(state.structures) do
-        if s.kind==1 and not s.uc and atWar[s.ownerId] and not friendly(s.ownerId) then
+        local enemy=state.players[s.ownerId]
+        local captureInstead=options.preserveBotCities and enemy and enemy.isBot==true and me
+            and me.troops>=enemy.troops*options.strength and not attackers[s.ownerId]
+        if s.kind==1 and not s.uc and atWar[s.ownerId] and not friendly(s.ownerId) and not captureInstead then
             if buffer.readu8(state.owners,s.tile)==s.ownerId then table.insert(cities,s) end
             if #cities>=48 then break end
         end
@@ -827,7 +874,7 @@ function Strategy.try_build(defensive)
     local contacts=Strategy.contacts()
     local me=state.players[state.id]
     local highThreat=defensive
-    for _,c in pairs(contacts) do if c.troops>=me.troops*0.8 then highThreat=true end end
+    for id,c in pairs(contacts) do if c.troops*Strategy.threat_factor(id)>=me.troops*0.8 then highThreat=true end end
     local kind,tile,cost,free=nil,nil,nil,false
     if options.posts and highThreat then
         local posts=0
@@ -1041,6 +1088,7 @@ local function state_event(kind,payload,extra)
             else state.structures[s.tile]=s end
         end
         if extra then state.structuresReady=true end
+        state.cityCache=nil
     elseif kind=="built" then
         state.errorCount=0;state.gold=payload.gold or state.gold
         if payload.kind==1 then state.cityCost=payload.cost or state.cityCost
@@ -1196,32 +1244,26 @@ local function run_step()
     if options.attack or options.expand then
         local truce=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
         if os.clock()-(state.playingAt or 0)<truce then state.reason="Beginbescherming afwachten";return end
-        local weakest=nil
-        for id in pairs(targets) do
-            local enemy=state.players[id]
-            if id~=0 and not busy[id] and enemy and enemy.alive and (options.attack or enemy.isBot)
-                and (not options.protect or not state.targetProtected[id]) and me.troops>=enemy.troops*options.strength then
-                if not weakest or enemy.troops<state.players[weakest].troops then weakest=id end
+        local weakest,bestScore=nil,-math.huge
+        for id,tile in pairs(targets) do
+            if id~=0 and not busy[id] and (not options.protect or not state.targetProtected[id]) then
+                local score=Strategy.target_score(id,tile,0)
+                if score and score>bestScore then weakest,bestScore=id,score end
             end
         end
-        if weakest then
-            if send({t="attack",tile=targets[weakest],ratio=ratio},"aanval op zwakkere buur "..weakest) then state.lastSend=os.clock() end
-            return
-        else state.reason="Geen nieuw veilig landfront; wateroversteek onderzoeken" end
+        if not weakest then state.reason="Geen nieuw veilig landfront; wateroversteek onderzoeken" end
         if options.rivers and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
-            local targetId,target=nil,nil
+            local targetId,target,waterScore=nil,nil,-math.huge
             for id,entry in pairs(state.waterTargets or {}) do
-                local enemy=state.players[id]
-                local allowed=(id==0 and options.expand) or (enemy and enemy.alive and (options.attack or enemy.isBot)
-                    and me.troops>=enemy.troops*options.strength)
+                local score=id==0 and options.expand and 0 or Strategy.target_score(id,entry.tile,entry.distance)
                 local pending=state.riverOrders[id]
-                if allowed and not targets[id] and not busy[id] and not friendly(id)
+                if score and not targets[id] and not busy[id] and not friendly(id)
                     and (not pending or pending.untilTime<=os.clock()) then
-                    if not target or entry.distance<target.distance then targetId,target=id,entry end
+                    if score>waterScore then targetId,target,waterScore=id,entry,score end
                 end
             end
             local boatTroops=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
-            if target and boatTroops>=(Config.TRANSPORT_BOAT_MIN_TROOPS or 250)
+            if target and waterScore>bestScore and boatTroops>=(Config.TRANSPORT_BOAT_MIN_TROOPS or 250)
                 and me.troops-boatTroops>=(state.requiredReserve or 0) then
                 if send({t="attack",tile=target.tile,ratio=ratio},"rivier/korte waterroute naar "..targetId.."; server kiest landbrug of transport") then
                     state.lastSend=os.clock()
@@ -1230,6 +1272,13 @@ local function run_step()
                 return
             end
             state.reason="Geen veilige beschikbare wateroversteek binnen zoekafstand"
+        end
+        if weakest then
+            local cityCount=Strategy.city_value(weakest)
+            local bot=state.players[weakest].isBot==true
+            local description=bot and ("botland "..weakest.." veroveren; "..cityCount.." zichtbare steden") or "voorzichtige aanval op speler/onbekend land "..weakest
+            if send({t="attack",tile=targets[weakest],ratio=ratio},description) then state.lastSend=os.clock() end
+            return
         end
     else state.reason="Uitbreiden en aanvallen staan uit"
     end
