@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="3.9-reinforcement-defense"
+local VERSION="4.0-breakout-strategy"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -350,7 +350,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=3.9")
+]=],snapshot,RAW_URL.."?v=4.0")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -759,6 +759,55 @@ function Strategy.opportunity_ratio(id,covered)
         if committed>=needed and me.troops-committed>=required and (not best or ratio<best) then best=ratio end
     end
     return best,required
+end
+function Strategy.breakout_ratio(id,covered,support)
+    local me,enemy=state.players[state.id],state.players[id]
+    if not options.attack or not me or not enemy or not enemy.alive or friendly(id) or #state.incoming>0 then return nil end
+    local deployed=0
+    for _,front in ipairs(state.outgoing) do
+        if front.id~=id and front.id~=0 then return nil end
+        if front.id==id then deployed+=front.troops end
+    end
+    if me.troops+deployed*0.60<enemy.troops*1.15 then return nil end
+    local strongest,total=0,0
+    for other,c in pairs(Strategy.contacts()) do
+        if other~=id then
+            local strength=c.troops*Strategy.threat_factor(other)
+            strongest=math.max(strongest,strength);total+=strength
+        end
+    end
+    local reserve=math.max(me.troops*0.25,strongest*0.55+total*0.10+enemy.troops*0.10)
+    local needed=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*(covered and 0.50 or 0.25))
+    if support then needed=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*(covered and 0.24 or 0.12)) end
+    local best=nil
+    for _,ratio in ipairs(Config.attackPresets(state.mode)) do
+        local sent=math.floor(me.troops*ratio)
+        if ratio<=0.50 and sent>=needed and me.troops-sent>=reserve and (not best or ratio<best) then best=ratio end
+    end
+    return best,reserve
+end
+function Strategy.breakout_plan(targets)
+    local me=state.players[state.id]
+    if not options.attack or not me or #state.incoming>0 or #state.outgoing>0 then state.boxedSince=nil;return nil end
+    if targets[0] then state.boxedSince=nil;return nil end
+    for id in pairs(state.waterTargets or {}) do if id==0 and options.rivers then state.boxedSince=nil;return nil end end
+    local now=os.clock()
+    state.boxedSince=state.boxedSince or now
+    local progress=math.max(state.boxedSince,state.lastCaptureAt or 0,state.playingAt or 0)
+    if now-progress<30 or now-(state.lastBreakoutAt or -10000)<60 then return nil end
+    local best,bestRatio,bestReserve,bestScore=nil,nil,nil,-math.huge
+    for id,tile in pairs(targets) do
+        if id~=0 then
+            local ratio,reserve=Strategy.breakout_ratio(id,state.targetProtected[id],false)
+            local enemy=state.players[id]
+            if ratio and enemy then
+                local cities=Strategy.city_value(id)
+                local score=-enemy.troops/math.max(1,me.troops)*1000+math.min(cities,5)*20
+                if score>bestScore then best,bestRatio,bestReserve,bestScore=id,ratio,reserve,score end
+            end
+        end
+    end
+    return best,bestRatio,bestReserve
 end
 function Strategy.target_score(id,tile,distance)
     local me,enemy=state.players[state.id],state.players[id]
@@ -1297,6 +1346,8 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         local enabled=(id==0 and options.expand) or (id~=0 and (options.attack or (economic and options.expand)))
         local ratio=economic and economicRatio or normalRatio
         local tile=targets[id]
+        local breakout=state.breakout and state.breakout.id==id and now<state.breakout.untilTime
+        if breakout then ratio=Strategy.breakout_ratio(id,state.targetProtected[id],true) end
         if id==0 then
             tile=nil
             local anchor=nil
@@ -1320,9 +1371,9 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         end
         local record=state.boosts[id] or {at=-10000,bursts=0,captureAt=-10000}
         if (state.lastCaptureAt or -10000)>record.captureAt then record.bursts=0 end
-        local eligible=id==0 or Strategy.target_score(id,tile or 0,0)~=nil
+        local eligible=id==0 or breakout or Strategy.target_score(id,tile or 0,0)~=nil
         if enabled and ratio and tile and eligible and not friendly(id)
-            and (not options.protect or not state.targetProtected[id])
+            and (not options.protect or not state.targetProtected[id] or breakout)
             and now-record.at>=options.reinforceDelay and record.bursts<options.maxBoosts then
             local committed=math.floor(me.troops*ratio)
             local depleted=front.troops<committed*0.5
@@ -1435,6 +1486,7 @@ local function state_event(kind,payload,extra)
         state.blockedBuild={};state.plannedBlasts={};state.gold=nil;state.cityCost=nil;state.postCost=nil
         state.freeCities=0;state.freePosts=0;state.freeNukes=0;state.freeSams=0;state.samCost=nil
         state.reinforceCost=nil;state.reinforceTroops=nil;state.reinforceQuoteAt=nil
+        state.boxedSince=nil;state.lastBreakoutAt=nil;state.breakout=nil
         state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
@@ -1721,6 +1773,16 @@ local function run_step()
                 if orderRatio and score and score>bestScore then weakest,bestScore,bestRatio,bestReserve=id,score,orderRatio,orderReserve end
             end
         end
+        if not weakest and attacksAllowed then
+            local escape,escapeRatio,escapeReserve=Strategy.breakout_plan(targets)
+            if escape then
+                if send({t="attack",tile=targets[escape],ratio=escapeRatio},"UITBRAAK via "..escape.." na stilstand | inzet "..math.floor(me.troops*escapeRatio).." | thuis "..math.floor(me.troops*(1-escapeRatio))) then
+                    state.lastSend=os.clock();state.lastBreakoutAt=os.clock()
+                    state.breakout={id=escape,untilTime=os.clock()+90};state.requiredReserve=math.ceil(escapeReserve)
+                end
+                return
+            end
+        else state.boxedSince=nil end
         if not weakest then state.reason="Geen nieuw veilig landfront; wateroversteek onderzoeken" end
         if options.rivers and state.transportKnown~=false and (state.transportCount or 0)<(Config.TRANSPORT_BOAT_MAX_PER_PLAYER or 3) then
             local targetId,target,waterScore,waterRatio,waterReserve=nil,nil,-math.huge,nil,nil
