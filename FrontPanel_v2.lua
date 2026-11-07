@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.10-active-defense"
+local VERSION="6.11-growth-defense"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
+ growthDefense=true,adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -593,6 +593,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Anti-nuke bij steden","sams")
  toggle("Oorlog","Antiraketdekking laten meegroeien","adaptiveSams")
  toggle("Oorlog","Snel inkomende legers opvangen","activeDefense")
+ toggle("Oorlog","Groeireserve behouden bij verdedigen","growthDefense")
  toggle("Oorlog","Botlanden met steden eerst","botCities")
  toggle("Oorlog","Huizen van zwakke landen heel houden","preserveBotCities")
  toggle("Oorlog","Groeicurve benutten","growthAware")
@@ -739,7 +740,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.10",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.11",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -2514,6 +2515,61 @@ function Strategy.defense_budget()
     return hold,incoming>=me.troops*0.65 or (heavyLoss and incoming>=me.troops*0.15)
 end
 function Strategy.defense_ratio(id)
+    if not options.growthDefense or not options.activeDefense or Config.OPPOSING_ATTACKS_CANCEL==false then return Strategy.force_defense_ratio(id) end
+    local me,enemy=state.players[state.id],state.players[id]
+    local function blocked(reason) state.counterReason=reason;return nil end
+    if not options.defend or not me or not me.alive or not enemy or not enemy.alive or friendly(id) then return blocked("Geen geldig verdedigingsdoel") end
+    if state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return blocked("Wachten op bevestigde troepen en aanval na order") end
+    local target,total,other=0,0,0
+    for _,front in ipairs(state.incoming) do
+        total+=math.max(0,front.troops)
+        if front.id==id then target+=math.max(0,front.troops) end
+    end
+    if target<=0 then return blocked("Geen inkomend leger van deze tegenstander") end
+    for otherId,contact in pairs(Strategy.contacts()) do
+        if otherId~=id then other=math.max(other,contact.troops*Strategy.threat_factor(otherId)) end
+    end
+    local cap=Strategy.capacity(me)
+    local peak=Strategy.growth_peak(cap)
+    local rate=Strategy.growth_model(me.troops,cap)
+    local loss=math.max(0,state.homeLossRate or 0)
+    local falling=loss>=math.max(30,(me.tiles or 0)*0.003)
+    local collapse=loss>0 and (me.tiles or 0)/loss<90
+    local critical=falling or collapse
+    local growthFloor=cap*peak*(critical and 0.45 or 0.75)
+    local otherIncoming=math.max(0,total-target)
+    local hardHold=math.max((Config.MIN_ATTACK_TROOPS or 250)*2,me.troops*(critical and 0.15 or 0.30),
+        math.min(me.troops*0.40,other*0.15+otherIncoming*0.5))
+    local complete,partial=nil,nil
+    for _,ratio in ipairs(Config.attackPresets(state.mode)) do
+        local spent=math.floor(me.troops*ratio)
+        local home=me.troops-spent
+        if ratio<=0.75 and spent>=(Config.MIN_ATTACK_TROOPS or 250) and home>=hardHold then
+            local gain=Strategy.growth_model(home,cap)
+            local clears=spent>=target
+            local growthSafe=home>=growthFloor or gain>=rate*0.92
+            if clears and (growthSafe or critical or total<=target*1.05) then
+                if not complete or ratio<complete then complete=ratio end
+            elseif not clears and growthSafe and ratio<=(critical and 0.50 or 0.35) then
+                if not partial or ratio>partial then partial=ratio end
+            end
+        end
+    end
+    local recovery=state.defenseRecovery
+    if not complete and partial and recovery and not critical and me.troops<math.min(growthFloor,recovery.troops)
+        and os.clock()-recovery.at<12 then partial=nil end
+    if not complete and not critical and me.troops<growthFloor then partial=nil end
+    local selected=complete or partial
+    state.defenseGrowth={capacity=cap,peak=peak,floor=growthFloor,critical=critical,incoming=total,
+        currentGrowth=rate,homeLossRate=loss,ratio=selected,
+        remaining=selected and me.troops-math.floor(me.troops*selected) or me.troops}
+    if not selected then return blocked("Groeiverdediging: leger herstellen; dreiging en landverlies blijven bewaakt") end
+    state.counterReason=(complete and "Aanval opvangen" or "Aanval gedoseerd afremmen")..": "..math.floor(selected*100)
+        .."%; thuis "..math.floor(state.defenseGrowth.remaining).." | groeidoel "..math.ceil(growthFloor)
+        ..(critical and " | snel landverlies: noodreserve" or "")
+    return selected
+end
+function Strategy.force_defense_ratio(id)
     if not options.activeDefense or Config.OPPOSING_ATTACKS_CANCEL==false then return Strategy.legacy_defense_ratio(id) end
     local me,enemy=state.players[state.id],state.players[id]
     local function blocked(reason) state.counterReason=reason;return nil end
@@ -3033,6 +3089,8 @@ function Strategy.emergency_defense_step()
     if not ok then error(sent,0) end
     if sent then
         state.lastSend=os.clock();state.defenseCounterAt=os.clock()
+        local me=state.players[state.id]
+        state.defenseRecovery={at=os.clock(),troops=me.troops}
         Recorder.emit("active_defense",{id=worst.id,incoming=worst.troops,ratio=ratio})
         return true
     end
@@ -3090,7 +3148,7 @@ function Strategy.capture_round_memory(payload)
     local memory={}
     for _,key in ipairs({"playingAt","lastCaptureAt","lastBreakoutAt","breakout","frontProgress","boosts",
         "territoryGrowth","catchupLeader","catchupActive","orderSerial","lastNuke","lastNukeScan","nukeSalvoCount",
-        "nukeFastBlockedUntil","nukePending","nukeBudgetAfter","defenseCounterAt","riverOrders","waterFailures","waterOwnerRetry","waterStalledAt","lastFallbackTransport","lastHostileMissile"}) do memory[key]=state[key] end
+        "nukeFastBlockedUntil","nukePending","nukeBudgetAfter","defenseCounterAt","riverOrders","waterFailures","waterOwnerRetry","waterStalledAt","lastFallbackTransport","lastHostileMissile","defenseRecovery"}) do memory[key]=state[key] end
     return memory
 end
 function Strategy.restore_round_memory(memory)
@@ -3154,7 +3212,7 @@ local function state_event(kind,payload,extra)
         state.boxedSince=nil;state.lastBreakoutAt=nil;state.breakout=nil
         state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
         state.quarantinedAttack={};state.attackOrders={};state.mapRepairPending=false;state.containedDefense=false
-        state.humanFinishReason=nil;state.shieldStatus=nil;state.lastHostileMissile=nil;state.defenseOrder=nil
+        state.humanFinishReason=nil;state.shieldStatus=nil;state.lastHostileMissile=nil;state.defenseOrder=nil;state.defenseGrowth=nil;state.defenseRecovery=nil
         state.nukePending=nil;state.nukeBudgetAfter=nil;state.nukeSalvoCount=0;state.nukeFastBlockedUntil=0;state.fastFrontOrder=nil
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
@@ -3761,7 +3819,7 @@ function Recorder.decisions()
   lastAction=state.lastAction,actionDelay=Config and Strategy.action_delay(),
   timeSinceCapture=os.clock()-(state.lastCaptureAt or os.clock()),
   counterReason=state.counterReason,nukeReason=state.nukeReason,humanFinishReason=state.humanFinishReason,containedDefense=state.containedDefense,
-  shieldStatus=state.shieldStatus,lastHostileMissile=state.lastHostileMissile,waterReason=state.waterSearchInfo,settings=options})
+  defenseGrowth=state.defenseGrowth,shieldStatus=state.shieldStatus,lastHostileMissile=state.lastHostileMissile,waterReason=state.waterSearchInfo,settings=options})
 end
 function Recorder.render()
  local lines={}
