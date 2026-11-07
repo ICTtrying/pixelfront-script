@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.5-verified-mechanics"
+local VERSION="6.6-human-endgame"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- protect=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
+ protect=true,finishHumans=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -582,6 +582,7 @@ local ui_ok,ui_error=xpcall(function()
  label("Match","Auto spawn kiest op historische kaarten een groot beschikbaar land; op andere kaarten een vrije plek. Herladen wordt aangevraagd bij je executor en is afhankelijk van diens ondersteuning.",120)
  toggle("Oorlog","Uitbreiden","expand"); toggle("Oorlog","Zwakke buren aanvallen","attack"); toggle("Oorlog","Verdedigen","defend")
  toggle("Oorlog","Bescherm tegen buren","protect")
+ toggle("Oorlog","Laatste zwakke menselijke tegenstanders eerst","finishHumans")
  toggle("Oorlog","Steden bouwen","cities")
  toggle("Oorlog","Grensposten bouwen","posts")
  toggle("Oorlog","Strategische atoomnukes","nukes")
@@ -727,14 +728,14 @@ task.spawn(function()
   end
   local source=game:HttpGet(%q)
   local remote_version=source:match('local%%s+VERSION%%s*=%%s*"([^"\n]+)"')
-  assert(remote_version==%q,"GitHub bevat versie "..tostring(remote_version).."; verwacht "..%q..". Voer het gedownloade 6.5-bestand opnieuw uit.")
+  assert(remote_version==%q,"GitHub bevat versie "..tostring(remote_version).."; verwacht "..%q..". Voer het gedownloade bestand opnieuw uit.")
   local run,compile_error=loadstring(source)
   assert(run,compile_error)
   run()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.5",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.6",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1223,6 +1224,32 @@ function Strategy.breakout_plan(targets)
     end
     return best,bestRatio,bestReserve
 end
+function Strategy.endgame_humans()
+    local me=state.players[state.id]
+    if not options.finishHumans or not options.attack or not me or not me.alive or me.troops<=0 then return {},0 end
+    local context=state.planContext
+    local cache=context and context.humanEndgame
+    if cache and cache.players==state.players and cache.allies==state.allies and cache.troops==me.troops then
+        return cache.targets,cache.count
+    end
+    local count,total=0,0
+    for id,enemy in pairs(state.players) do
+        if id~=state.id and enemy.alive and enemy.isBot==false and not friendly(id) then
+            count+=1;total+=math.max(0,enemy.troops)
+        end
+    end
+    local targets={}
+    if count>=1 and count<=3 and me.troops>=math.max(Config.MIN_ATTACK_TROOPS or 250,total*4) then
+        for id,enemy in pairs(state.players) do
+            if id~=state.id and enemy.alive and enemy.isBot==false and not friendly(id)
+                and me.troops>=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*8) then
+                targets[id]=true
+            end
+        end
+    end
+    if context then context.humanEndgame={players=state.players,allies=state.allies,troops=me.troops,targets=targets,count=count} end
+    return targets,count
+end
 function Strategy.target_score(id,tile,distance,pressure)
     local me,enemy=state.players[state.id],state.players[id]
     if not me or not enemy or not enemy.alive or friendly(id) then return nil end
@@ -1234,6 +1261,8 @@ function Strategy.target_score(id,tile,distance,pressure)
     local land=math.sqrt(math.max(0,enemy.tiles or 0))*100
     local cost=1+enemy.troops/math.max(1,me.troops)*8
     local reward=(2000+assets+land)/cost
+    local humanTargets=Strategy.endgame_humans()
+    if humanTargets[id] then reward+=1000000 end
     return reward-Strategy.nearby_danger(tile)*50-(distance or 0)*4
         +math.min(200,(state.planBorders and state.planBorders[id]) or 0)*2,
         cities,enemy.isBot==true
@@ -2238,6 +2267,53 @@ function Strategy.land_front_limit()
  elseif denied then state.frontLimitDenied=nil end
  return limit
 end
+function Strategy.human_priority_pending(targets)
+    local humans=Strategy.endgame_humans()
+    if not next(humans) or Strategy.active_orders()>=Strategy.land_front_limit() then return false end
+    local busy={}
+    for _,front in ipairs(state.outgoing) do busy[front.id]=true end
+    for id,pending in pairs(state.riverOrders or {}) do
+        if not pending.failed and pending.untilTime>os.clock() then busy[id]=true end
+    end
+    for id in pairs(humans) do if targets[id] and not busy[id] then return true end end
+    return false
+end
+function Strategy.try_finish_humans(targets)
+    if #state.incoming>0 or not fresh() or not state.ready or state.phase~="playing" then return false end
+    local humans,count=Strategy.endgame_humans()
+    if not next(humans) then return false end
+    local grace=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
+    if os.clock()-(state.playingAt or 0)<grace then return false end
+    if Strategy.active_orders()>=Strategy.land_front_limit() then return false end
+    local busy={}
+    for _,front in ipairs(state.outgoing) do busy[front.id]=true end
+    for id,pending in pairs(state.riverOrders or {}) do
+        if not pending.failed and pending.untilTime>os.clock() then busy[id]=true end
+    end
+    local best=nil
+    for id in pairs(humans) do
+        local tile=targets[id]
+        if tile and not busy[id] then
+            local covered=state.targetProtected and state.targetProtected[id]
+            local ratio,reserve=Strategy.opportunity_ratio(id,covered)
+            if ratio then
+                local finishing,_,finishReserve=Strategy.finish_ratio(id,0,false)
+                if finishing then ratio=finishing;reserve=finishReserve end
+                local score=Strategy.target_score(id,tile,0)
+                if score and (not best or score>best.score) then best={id=id,tile=tile,ratio=ratio,reserve=reserve,score=score} end
+            end
+        end
+    end
+    if not best then return false end
+    if send({t="attack",tile=best.tile,ratio=best.ratio},"OVERWINNINGSPRIORITEIT: zwakke menselijke tegenstander "..best.id
+        .." vóór bots; nog "..count.." menselijke tegenstanders | thuisreserve "..math.ceil(best.reserve or 0)) then
+        state.lastSend=os.clock();state.requiredReserve=best.reserve
+        state.humanFinishReason="Mens "..best.id.." eerst; "..count.." menselijke tegenstanders over"
+        Recorder.emit("human_endgame_target",{id=best.id,count=count,ratio=best.ratio,reserve=best.reserve})
+        return true
+    end
+    return false
+end
 function Strategy.quick_campaign(targets)
  if not options.attack or #state.outgoing==0 or #state.incoming>0 or not fresh() then return false end
  local me=state.players[state.id]
@@ -2296,6 +2372,7 @@ function Strategy.fast_front_step()
         or #state.outgoing==0 or os.clock()-state.lastAction<0.5
         or os.clock()-state.lastAction>=Strategy.action_delay()
         or state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
+    if Strategy.human_priority_pending(enemy_targets()) then return false end
     local me=state.players[state.id]
     if not me or not me.alive then return false end
     local normalRatio=choose_ratio(false)
@@ -2334,6 +2411,7 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
     end
     state.boosts=state.boosts or {}
     local best=nil
+    local humanTargets=Strategy.endgame_humans()
     for _,front in ipairs(state.outgoing) do
         local id=front.id
         local enemy=state.players[id]
@@ -2396,6 +2474,7 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
             end
             if ready and not oversupplied then
                 local score=(depleted and 1000 or 0)+(id~=0 and 100 or 0)-front.troops/math.max(1,committed)
+                if humanTargets[id] then score+=1000000 end
                 if not best or score>best.score then best={id=id,tile=tile,ratio=ratio,record=record,score=score} end
             end
         end
@@ -2582,6 +2661,7 @@ local function state_event(kind,payload,extra)
         state.reinforceCost=nil;state.reinforceTroops=nil;state.reinforceQuoteAt=nil
         state.boxedSince=nil;state.lastBreakoutAt=nil;state.breakout=nil
         state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
+        state.humanFinishReason=nil
         state.nukePending=nil;state.nukeBudgetAfter=nil;state.nukeSalvoCount=0;state.nukeFastBlockedUntil=0;state.fastFrontOrder=nil
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
@@ -2930,6 +3010,7 @@ local function run_step_inner()
         state.reason="VERDEDIGEN: "..(critical and "zware druk; " or "")..(state.counterReason or "tegenaanval loopt of wacht op herbeoordeling").." | thuisreserve "..math.ceil(hold)
         return
     end
+    if Strategy.try_finish_humans(targets) then return end
     if Strategy.quick_campaign(targets) then return end
     local mapGeneration=state.generation
     Strategy.water_targets()
@@ -3186,7 +3267,7 @@ function Recorder.decisions()
   pendingBlasts=state.plannedBlasts,lastBuild=state.lastBuild,lastNuke=state.lastNuke,
   lastAction=state.lastAction,actionDelay=Config and Strategy.action_delay(),
   timeSinceCapture=os.clock()-(state.lastCaptureAt or os.clock()),
-  counterReason=state.counterReason,nukeReason=state.nukeReason,
+  counterReason=state.counterReason,nukeReason=state.nukeReason,humanFinishReason=state.humanFinishReason,
   waterReason=state.waterSearchInfo,settings=options})
 end
 function Recorder.render()
