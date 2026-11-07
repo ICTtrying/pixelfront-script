@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.20-fast-counter"
+local VERSION="6.21-preset-planner"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- fastDecisions=true,counterFinish=true,balancedShield=true,borderGuard=true,sustainedDefense=true,combatAware=true,preciseOrders=true,layeredSams=true,attritionAware=true,capRecovery=true,neighborReserve=true,growthDefense=true,adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
+ fastDecisions=true,counterFinish=true,balancedShield=true,borderGuard=true,sustainedDefense=true,combatAware=true,layeredSams=true,attritionAware=true,capRecovery=true,neighborReserve=true,growthDefense=true,adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -602,7 +602,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Snel inkomende legers opvangen","activeDefense")
  toggle("Oorlog","Groeireserve behouden bij verdedigen","growthDefense")
  toggle("Oorlog","Gevechtskosten meewegen bij doelkeuze","combatAware")
- toggle("Oorlog","Passende inzet tussen vaste percentages","preciseOrders")
+ label("Oorlog","Inzet volgt de serverpresets: gewoon 33%; ranked 25/50/75%.",42)
  toggle("Oorlog","Extra antiraketlaag bij waargenomen salvo","layeredSams")
  toggle("Oorlog","Uitputtingsslag vermijden bij verdediging","attritionAware")
  toggle("Oorlog","Botlanden met steden eerst","botCities")
@@ -751,7 +751,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.20",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.21",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -983,6 +983,42 @@ local function passable(tile)
     local b=buffer.readu8(state.terrain,tile)
     return bit32.btest(b,128) and bit32.band(b,63)<63
 end
+function Strategy.set_frontier(tile,candidate)
+    state.frontierGroups=state.frontierGroups or {}
+    state.frontierOwner=state.frontierOwner or {}
+    local previous=state.frontierOwner[tile]
+    local owner=candidate and buffer.readu8(state.owners,tile) or nil
+    if previous~=owner then
+        state.contactCache=nil
+        if previous~=nil then
+            local group=state.frontierGroups[previous]
+            local index=group.index[tile]
+            local last=group.tiles[#group.tiles]
+            group.tiles[index]=last;group.index[last]=index
+            group.tiles[#group.tiles]=nil;group.index[tile]=nil
+            if #group.tiles==0 then state.frontierGroups[previous]=nil end
+        end
+        if owner~=nil then
+            local group=state.frontierGroups[owner]
+            if not group then group={tiles={},index={}};state.frontierGroups[owner]=group end
+            group.tiles[#group.tiles+1]=tile;group.index[tile]=#group.tiles
+        end
+        state.frontierOwner[tile]=owner
+    end
+    state.frontier[tile]=candidate or nil
+end
+function Strategy.border_points(id,limit)
+    local group=state.frontierGroups and state.frontierGroups[id]
+    if not group then return {},0 end
+    local points={};local count=#group.tiles
+    local samples=math.min(limit or 24,count)
+    local offset=math.floor(os.clock()/2)%math.max(1,count)
+    for i=0,samples-1 do
+        local tile=group.tiles[(math.floor(i*count/samples)+offset)%count+1]
+        if Strategy.attack_tile_valid(tile,id) then points[#points+1]=tile end
+    end
+    return points,count
+end
 local function refresh_tile(tile)
     if not state.terrain or not state.owners then return end
     local candidate=false
@@ -991,7 +1027,7 @@ local function refresh_tile(tile)
             if buffer.readu8(state.owners,other)==state.id then candidate=true end
         end)
     end
-    state.frontier[tile]=candidate or nil
+    Strategy.set_frontier(tile,candidate)
     state.coast=state.coast or {}
     local coast=false
     if buffer.readu8(state.owners,tile)==state.id and passable(tile) then
@@ -1007,7 +1043,7 @@ function Strategy.quarantine_attack_tile(tile,own)
     state.blockedAttack=state.blockedAttack or {}
     state.quarantinedAttack[tile]={at=os.clock(),own=own==true}
     state.blockedAttack[tile]=math.huge
-    state.frontier[tile]=nil
+    Strategy.set_frontier(tile,false)
     if own and state.owners then
         buffer.writeu8(state.owners,tile,state.id)
         refresh_tile(tile);neighbours(tile,refresh_tile)
@@ -1121,7 +1157,7 @@ local function index_map(generation)
             if owner==state.id then
                 refresh_tile(tile);Strategy.sample_owned(tile)
                 neighbours(tile,function(other)
-                    if buffer.readu8(state.owners,other)~=state.id and passable(other) then state.frontier[other]=true end
+                    if buffer.readu8(state.owners,other)~=state.id and passable(other) then refresh_tile(other) end
                 end)
             end
             if owner~=0 and owner~=state.id and not state.representatives[owner] then
@@ -1235,17 +1271,41 @@ function Strategy.threat_factor(id)
     local cities=Strategy.city_value(id)
     return cities>0 and 0.45 or 0.20
 end
-function Strategy.attack_choices(needed)
-    local presets=Config.attackPresets(state.mode)
-    if not options.preciseOrders then return presets end
-    local me=state.players[state.id]
-    if not me or me.troops<=0 then return presets end
-    local choices=table.clone(presets)
-    local ratio=math.max(Config.MIN_ATTACK_RATIO or 0.05,math.ceil(needed/me.troops*1000-1e-9)/1000)
-    if math.floor(me.troops*ratio)<math.ceil(needed) then ratio+=0.001 end
-    local limit=math.min(0.75,Config.MAX_ATTACK_RATIO or 1)
-    if ratio<=limit then choices[#choices+1]=ratio end
-    return choices
+function Strategy.attack_choices(_needed)
+    return Config.attackPresets(state.mode)
+end
+function Strategy.minimum_ratio()
+    local smallest=math.huge
+    for _,ratio in ipairs(Strategy.attack_choices()) do smallest=math.min(smallest,ratio) end
+    return smallest
+end
+function Strategy.legal_ratio(ratio)
+    if type(ratio)~="number" or ratio~=ratio then return false end
+    for _,preset in ipairs(Strategy.attack_choices()) do
+        if math.abs(preset-ratio)<1e-9 then return true end
+    end
+    return false
+end
+function Strategy.post_covers(tile,id)
+    local cache=state.postCache
+    if not cache or cache.generation~=state.generation or cache.revision~=state.mapRevision
+        or cache.structures~=state.structureRevision then
+        cache={generation=state.generation,revision=state.mapRevision,structures=state.structureRevision,owners={}}
+        for _,post in pairs(state.structures or {}) do
+            if post.kind==3 and not post.uc and buffer.readu8(state.owners,post.tile)==post.ownerId then
+                local list=cache.owners[post.ownerId] or {};cache.owners[post.ownerId]=list
+                list[#list+1]=post.tile
+            end
+        end
+        state.postCache=cache
+    end
+    local radius=Config.DEFENSE_POST_RANGE or 30
+    local x,y=tile%W,math.floor(tile/W)
+    for _,point in ipairs(cache.owners[id] or {}) do
+        local dx,dy=x-point%W,y-math.floor(point/W)
+        if dx*dx+dy*dy<=radius*radius then return true end
+    end
+    return false
 end
 function Strategy.combat_estimate(id,tile,committed)
     local me,enemy=state.players[state.id],state.players[id]
@@ -1254,11 +1314,7 @@ function Strategy.combat_estimate(id,tile,committed)
     local terrain=altitude<11 and 1 or altitude<21 and 2 or 3
     local mag=(Config.TERRAIN_MAG or {80,100,120})[terrain]
     local speed=(Config.TERRAIN_SPEED or {16.5,20,25})[terrain]
-    local covered=false
-    for _,post in pairs(state.structures or {}) do
-        if post.ownerId==id and post.kind==3 and not post.uc and buffer.readu8(state.owners,post.tile)==id
-            and Strategy.distance(tile,post.tile)<=(Config.DEFENSE_POST_RANGE or 30) then covered=true;break end
-    end
+    local covered=Strategy.post_covers(tile,id)
     if covered then mag*=Config.DEFENSE_POST_DEFENSE_BONUS or 5;speed*=Config.DEFENSE_POST_SPEED_BONUS or 3 end
     if enemy.isBot==true then mag*=Config.BOT_DEFENDER_LOSS_MULT or 1 end
     local floor=Config.DEFENSE_DEBUFF_FLOOR or 0.7
@@ -1299,6 +1355,10 @@ function Strategy.opportunity_ratio(id,covered)
     for _,ratio in ipairs(Strategy.attack_choices(needed)) do
         local committed=math.floor(me.troops*ratio)
         if committed>=needed and me.troops-committed>=required and (not best or ratio<best) then best=ratio end
+    end
+    if best then
+        local tile=Strategy.land_target(id)
+        if tile and not Strategy.offensive_budget({t="attack",tile=tile,ratio=best},true) then return nil,required end
     end
     return best,required
 end
@@ -1390,8 +1450,9 @@ end
 function Strategy.land_route(tile,id)
     if not options.routeAwareTargets or id==0 or not Strategy.attack_tile_valid(tile,id) then return nil end
     local cache=state.landRouteCache
-    if not cache or cache.generation~=state.generation then
-        cache={generation=state.generation,profiles={},byTile={}};state.landRouteCache=cache
+    if not cache or cache.generation~=state.generation or cache.revision~=state.mapRevision
+        or cache.structures~=state.structureRevision then
+        cache={generation=state.generation,revision=state.mapRevision,structures=state.structureRevision,profiles={},byTile={}};state.landRouteCache=cache
     end
     for i=#cache.profiles,1,-1 do
         local profile=cache.profiles[i]
@@ -1455,7 +1516,7 @@ function Strategy.target_score(id,tile,distance,pressure)
     local reward=(2000+assets+land)/cost
     if route and route.fragment then reward*=0.15 end
     if options.combatAware then
-        local estimate=Strategy.combat_estimate(id,tile,math.max(Config.MIN_ATTACK_TROOPS or 250,me.troops*0.1))
+        local estimate=Strategy.combat_estimate(id,tile,math.max(Config.MIN_ATTACK_TROOPS or 250,me.troops*Strategy.minimum_ratio()))
         if estimate then reward/=(1+estimate.lossPerTile/80+estimate.timeIndex/50) end
     end
     local humanTargets=Strategy.endgame_humans()
@@ -1531,7 +1592,8 @@ function Strategy.capacity_plan(targets)
                     if preset<=0.50 and sent>=needed and me.troops-sent>=hold and (not ratio or preset<ratio) then ratio=preset end
                 end
                 if state.catchupActive and boxed then ratio,hold=Strategy.breakout_ratio(id,state.targetProtected[id],false) end
-                local score=ratio and Strategy.target_score(id,tile,0,true)
+                local score=ratio and Strategy.offensive_budget({t="attack",tile=tile,ratio=ratio},true)
+                    and Strategy.target_score(id,tile,0,true)
                 if score and score>bestScore then best,bestRatio,bestHold,bestScore=id,ratio,hold,score end
             end
         end
@@ -1542,33 +1604,28 @@ function Strategy.capacity_plan(targets)
 end
 function Strategy.contacts()
     local context=state.planContext
-    if context and context.contacts and context.owners==state.owners and context.players==state.players
-        and context.frontier==state.frontier and context.water==state.waterTargets and context.allies==state.allies
-        and context.revision==state.mapRevision and context.generation==state.generation then return context.contacts end
+    local cache=state.contactCache
+    if cache and cache.players==state.players and cache.allies==state.allies
+        and cache.water==state.waterTargets and cache.revision==state.mapRevision
+        and cache.generation==state.generation and os.clock()-cache.at<0.5 then return cache.contacts end
     local contacts={}
-    for tile in pairs(state.frontier) do
-        local id=buffer.readu8(state.owners,tile)
+    for id in pairs(state.frontierGroups or {}) do
         local other=state.players[id]
         if id~=0 and other and other.alive and not friendly(id) then
-            local c=contacts[id]
-            if not c then c={id=id,tile=tile,border=0,troops=other.troops,points={}};contacts[id]=c end
-            c.border=c.border+1
-            if #c.points<24 then table.insert(c.points,tile)
-            else local k=math.random(1,c.border);if k<=24 then c.points[k]=tile end end
+            local points,count=Strategy.border_points(id,24)
+            if #points>0 then contacts[id]={id=id,tile=points[1],border=count,troops=other.troops,points=points} end
         end
     end
     for id,entry in pairs(state.waterTargets or {}) do
         local other=state.players[id]
-        if id~=0 and other and other.alive and not friendly(id) and not contacts[id] then
+        if id~=0 and other and other.alive and not friendly(id) and not contacts[id]
+            and Strategy.attack_tile_valid(entry.tile,id) then
             contacts[id]={id=id,tile=entry.tile,border=1,troops=other.troops,points={entry.tile}}
         end
     end
-    if context then
-        context.contacts=contacts;context.owners=state.owners;context.players=state.players
-        context.frontier=state.frontier;context.water=state.waterTargets;context.allies=state.allies
-        context.revision=state.mapRevision;context.generation=state.generation
-        context.scans=(context.scans or 0)+1
-    end
+    state.contactCache={players=state.players,allies=state.allies,water=state.waterTargets,
+        revision=state.mapRevision,generation=state.generation,at=os.clock(),contacts=contacts}
+    if context then context.scans=(context.scans or 0)+1 end
     return contacts
 end
 function Strategy.water_failure(id,entry,reason)
@@ -1762,6 +1819,7 @@ function Strategy.water_targets()
         local count=0;for _ in pairs(targets) do count+=1 end
         log(state.waterSearchInfo.." | doelen "..count);state.lastSeaLog=os.clock()
     end
+    if not alive or generation~=state.generation or not options.rivers or state.awaitingInit then return {} end
     state.waterCandidates=candidates;state.waterTargets=targets
     return targets
 end
@@ -2250,6 +2308,9 @@ function Strategy.action_delay()
             and enemy.troops>=me.troops*0.60 and (growth[id] or 0)>myRate*1.2+1 then racing=true;break end
     end
     state.racePressure=racing
+    if options.fastDecisions and fill>=0.90 then return math.min(options.interval,0.35) end
+    if options.fastDecisions and fill>=0.75 then return math.min(options.interval,0.5) end
+    if options.fastDecisions and options.fastFrontReinforce and #state.outgoing>0 then return math.min(options.interval,0.5) end
     if fill>=0.70 or (racing and fill>=0.45) then return math.min(options.interval,1) end
     if fill>=0.45 then return math.min(options.interval,1.5) end
     return options.interval
@@ -2270,7 +2331,7 @@ function Strategy.interleave_ready(kind)
     end
     return false
 end
-function Strategy.offensive_budget(payload)
+function Strategy.offensive_budget(payload,probe)
     if not options.neighborReserve or not options.protect then return true end
     local me=state.players[state.id]
     if not me or not me.alive then return false end
@@ -2294,52 +2355,71 @@ function Strategy.offensive_budget(payload)
     local cap=Strategy.capacity(me)
     local land=false
     neighbours(payload.tile,function(other) if buffer.readu8(state.owners,other)==state.id then land=true end end)
-    local spent=land and math.floor(me.troops*payload.ratio)
-        or math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
+    local spent=math.floor(me.troops*payload.ratio)
+    if not land then spent=math.max(spent,math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))) end
     local remaining=me.troops-spent
     local cautious=strongest>=me.troops*0.85 or strongest>=remaining*0.85
-    if cautious then state.cautionUntil=os.clock()+8 end
+    if cautious and not probe then state.cautionUntil=os.clock()+8 end
     local recovering=(state.cautionUntil or 0)>os.clock() and strongest>remaining/1.20
     if not cautious and not recovering then return true end
     local hold=math.max(strongest*1.05+second*0.15,cap*Strategy.growth_peak(cap)*0.75,me.troops*0.75)
-    state.neighborBudget={strongest=strongest,second=second,hold=hold,remaining=me.troops-spent,cautious=true}
+    if not probe then state.neighborBudget={strongest=strongest,second=second,hold=hold,remaining=me.troops-spent,cautious=true} end
     if me.troops-spent<hold then
         local owner=buffer.readu8(state.owners,payload.tile)
         local enemy=state.players[owner]
         local window=state.counterWindows and state.counterWindows[owner]
-        local smallLimit=strongest>me.troops*3 and 0.05 or 0.15
+        local smallLimit=0.35
         local gain=Strategy.growth_model(me.troops-spent,cap)
         if options.counterFinish and state.counterFinishOrder==owner and land and #state.incoming==0
             and window and window.endedAt and (window.expiresAt or 0)>os.clock()
             and enemy and enemy.alive and enemy.troops<=me.troops*0.125
-            and spent<=me.troops*(smallLimit+0.00001) and me.troops-spent>=me.troops*0.85
+            and spent<=me.troops*(smallLimit+0.00001) and me.troops-spent>=me.troops*0.65
+            and me.troops-spent>=strongest*0.80+second*0.15
             and gain>=Strategy.growth_model(me.troops,cap)*0.88 then
-            Recorder.emit("counter_reserve_exception",{id=owner,spent=spent,remaining=me.troops-spent,normalHold=hold})
+            if not probe then Recorder.emit("counter_reserve_exception",{id=owner,spent=spent,remaining=me.troops-spent,normalHold=hold}) end
             return true
         end
         local owner=buffer.readu8(state.owners,payload.tile)
         local enemy=state.players[owner]
         local cheap=owner==0 or (enemy and enemy.alive and enemy.troops<=me.troops*0.08 and spent>=enemy.troops*0.65)
         if options.capRecovery and state.capRecoveryOrder and hold>cap and land and #state.incoming==0
-            and me.troops>=cap*0.90 and spent<=me.troops*0.05001 and me.troops-spent>=cap*0.85 and cheap then
-            Recorder.emit("capacity_reserve_escape",{owner=owner,spent=spent,remaining=me.troops-spent,hold=hold,capacity=cap})
+            and me.troops>=cap*0.90 and spent<=me.troops*0.35001
+            and remaining>=cap*0.60 and remaining>=strongest*0.80+second*0.15 and cheap then
+            if not probe then Recorder.emit("capacity_reserve_escape",{owner=owner,spent=spent,remaining=me.troops-spent,hold=hold,capacity=cap}) end
             return true
         end
-        state.reason="LEGER OPBOUWEN: sterke buur "..math.ceil(strongest).." | thuisreserve "..math.ceil(hold)
-        Recorder.emit("neighbor_reserve_block",{tile=payload.tile,spent=spent,hold=hold,strongest=strongest})
+        if not probe then
+            state.reason="LEGER OPBOUWEN: sterke buur "..math.ceil(strongest).." | thuisreserve "..math.ceil(hold)
+            Recorder.emit("neighbor_reserve_block",{tile=payload.tile,spent=spent,hold=hold,strongest=strongest})
+        end
         return false
     end
     return true
 end
 function Strategy.order_ready(kind)
-    if kind=="attack" and state.counterFinishOrder and options.fastDecisions then return os.clock()-state.lastAction>=0.75 end
-    if kind=="attack" and state.defenseOrder and options.defend and options.activeDefense then return os.clock()-state.lastAction>=0.5 end
-    if kind=="attack" and state.fastFrontOrder and options.fastFrontReinforce then
-        return os.clock()-state.lastAction>=0.5
+    local now=os.clock()
+    if now-(state.lastWireAt or -10000)<0.15 then return false end
+    if options.dry then return now-state.lastAction>=Strategy.action_delay() end
+    if kind=="build" and options.parallelActions then
+        return now-(state.lastBuild or -10000)>=math.min(2,options.buildDelay)
     end
-    return os.clock()-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
+    if kind=="attack" then
+        local elapsed=now-(state.lastTroopOrder or state.lastAction)
+        if state.counterFinishOrder and options.fastDecisions then return elapsed>=0.35 end
+        if state.defenseOrder and options.defend and options.activeDefense then return elapsed>=0.5 end
+        if options.parallelActions then return elapsed>=Strategy.action_delay() end
+    end
+    return now-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
 end
 local function send(payload,description)
+    if payload.t=="attack" then
+        if not Strategy.legal_ratio(payload.ratio) then
+            Recorder.emit("order_revalidated",{payload=payload,reason="ratio is not a server preset"})
+            return false
+        end
+        if not fresh() or state.lastPlayers<=(state.lastSend or -100)
+            or state.lastFronts<=(state.lastSend or -100) then return false end
+    end
     if (payload.t=="build" or payload.t=="reinforce") and (state.nukePending
         or (state.nukeBudgetAfter and state.lastFronts<=state.nukeBudgetAfter)) then
         state.reason="Wachten op bevestigd nuke-budget voordat opnieuw goud wordt uitgegeven"
@@ -2367,6 +2447,7 @@ local function send(payload,description)
     if options.dry then Recorder.emit("plan_only",{payload=payload,description=description});state.reason="Observatie: "..description;log("PLAN: "..description); return false end
     Recorder.emit("order",{payload=payload,description=description,serial=(state.orderSerial or 0)+1})
     folder.Intent:FireServer(payload)
+    state.lastWireAt=os.clock()
     state.lastCommand=payload;state.orderSerial=(state.orderSerial or 0)+1
     if payload.t=="attack" then
         state.lastTroopOrder=os.clock()
@@ -2636,11 +2717,11 @@ function Strategy.open_ready(ratio,hold)
     if not ratio then return false end
     local me=state.players[state.id]
     if state.catchupActive and me and #state.incoming==0 and me.troops>=Strategy.capacity(me)*0.35
-        and ratio<=0.25 and me.troops-math.floor(me.troops*ratio)>=(hold or math.huge) then
+        and ratio<=0.35 and me.troops-math.floor(me.troops*ratio)>=(hold or math.huge) then
         state.economicStatus="Inhaalstrategie: eerder betaalbare open-landpuls"
         return true
     end
-    if Strategy.open_rival() and me and ratio<=0.25 and me.troops-math.floor(me.troops*ratio)>=(hold or math.huge) then
+    if Strategy.open_rival() and me and ratio<=0.35 and me.troops-math.floor(me.troops*ratio)>=(hold or math.huge) then
         state.economicStatus="Open-landrace: kleine preset; thuisleger op peil bij enige menselijke buur"
         return true
     end
@@ -2694,23 +2775,25 @@ function Strategy.land_target(id,preferred)
     if preferred and valid(preferred) then state.landTargetCache[id]=preferred;return preferred end
     local cached=state.landTargetCache[id]
     if cached and (not preferred or Strategy.distance(cached,preferred)<=64) and valid(cached) then return cached end
-    local cursor=state.landTargetCursor[id]
-    local ok,tile=pcall(next,state.frontier,cursor)
-    if not ok then tile=next(state.frontier) end
-    for checked=1,4096 do
-        if not tile then state.landTargetCursor[id]=nil;return nil end
-        state.landTargetCursor[id]=tile
-        if (not preferred or Strategy.distance(tile,preferred)<=64) and valid(tile) then state.landTargetCache[id]=tile;return tile end
-        tile=next(state.frontier,tile)
+    local group=state.frontierGroups and state.frontierGroups[id]
+    if not group or #group.tiles==0 then return nil end
+    local count=#group.tiles
+    local cursor=(state.landTargetCursor[id] or 0)%count
+    for checked=1,math.min(count,4096) do
+        local index=(cursor+checked-1)%count+1
+        local tile=group.tiles[index]
+        state.landTargetCursor[id]=index
+        if (not preferred or Strategy.distance(tile,preferred)<=64) and valid(tile) then
+            state.landTargetCache[id]=tile;return tile
+        end
     end
     return nil
 end
 function Strategy.defense_contacts()
-    local result={};local checked=0
-    for tile in pairs(state.frontier) do
-        checked+=1;if checked>4096 then break end
-        local id=buffer.readu8(state.owners,tile);local enemy=state.players[id]
-        if enemy and enemy.alive and not friendly(id) then result[id]={troops=enemy.troops} end
+    local result={}
+    for id,group in pairs(state.frontierGroups or {}) do
+        local enemy=state.players[id]
+        if #group.tiles>0 and enemy and enemy.alive and not friendly(id) then result[id]={troops=enemy.troops} end
     end
     return result
 end
@@ -2806,15 +2889,13 @@ function Strategy.defense_ratio(id)
     local otherIncoming=math.max(0,total-target)
     local hardHold=math.max((Config.MIN_ATTACK_TROOPS or 250)*2,me.troops*(critical and 0.15 or 0.30),
         math.min(me.troops*0.40,other*0.15+otherIncoming*0.5))
-    local minimum=math.max(0.05,Config.MIN_ATTACK_RATIO or 0.05)
+    local minimum=Strategy.minimum_ratio()
     local smallest=math.floor(me.troops*minimum)
     if total<me.troops*0.02 and loss<math.max(10,(me.tiles or 0)*0.0005)
         and smallest>math.max(target*3,me.troops*0.01) then
         return blocked("Kleine aanval bewaken: minimale tegeninzet te duur; groeileger behouden")
     end
-    local choices=table.clone(Config.attackPresets(state.mode))
-    local precise=math.max(minimum,math.ceil(target/me.troops*1000)/1000)
-    if precise<=0.75 then choices[#choices+1]=precise end
+    local choices=Strategy.attack_choices(target)
     local complete,partial=nil,nil
     for _,ratio in ipairs(choices) do
         local spent=math.floor(me.troops*ratio)
@@ -2915,54 +2996,39 @@ function Strategy.legacy_defense_ratio(id)
     return best
 end
 local function enemy_targets()
-    local result,scores,groups={},{},{}
+    local result={}
     state.targetProtected={}
-    for tile in pairs(state.frontier) do
-        local id=buffer.readu8(state.owners,tile)
-        if Strategy.attack_tile_valid(tile,id) then
-            local group=groups[id]
-            if not group then group={points={},count=0};groups[id]=group end
-            group.count+=1
-            if #group.points<24 then group.points[#group.points+1]=tile
-            else local index=math.random(1,group.count);if index<=24 then group.points[index]=tile end end
-            if group.count<=32 then
-            local covered=false
-            for _,structure in pairs(state.structures or {}) do
-                if structure.ownerId==id and structure.kind==3 and not structure.uc
-                    and Strategy.distance(tile,structure.tile)<=(Config.DEFENSE_POST_RANGE or 30) then covered=true;break end
-            end
+    for id in pairs(state.frontierGroups or {}) do
+        local points=Strategy.border_points(id,32)
+        local best,bestScore=nil,-math.huge
+        for _,tile in ipairs(points) do
+            local covered=Strategy.post_covers(tile,id)
             local score=-bit32.band(buffer.readu8(state.terrain,tile),63)-(covered and 100 or 0)
-            if not scores[id] or score>scores[id] then
-                result[id]=tile;scores[id]=score;state.targetProtected[id]=covered
-            end
-            end
+            if score>bestScore then best,bestScore=tile,score end
         end
-    end
-    if options.routeAwareTargets then
-        for id,group in pairs(groups) do
+        if best then
+            result[id]=best;state.targetProtected[id]=Strategy.post_covers(best,id)
             local enemy=state.players[id]
-            if enemy and Strategy.is_real_human(id,enemy) then
-                local first=result[id]
-                local distant=first
-                for _,point in ipairs(group.points) do
-                    if Strategy.distance(first,point)>Strategy.distance(first,distant) then distant=point end
+            if options.routeAwareTargets and Strategy.is_real_human(id,enemy) then
+                local distant,third=best,best
+                for _,point in ipairs(points) do
+                    if Strategy.distance(best,point)>Strategy.distance(best,distant) then distant=point end
                 end
-                local third=first
                 local spread=-1
-                for _,point in ipairs(group.points) do
-                    local distance=math.min(Strategy.distance(first,point),Strategy.distance(distant,point))
+                for _,point in ipairs(points) do
+                    local distance=math.min(Strategy.distance(best,point),Strategy.distance(distant,point))
                     if distance>spread then third=point;spread=distance end
                 end
-                local bestScore=-math.huge
-                for _,point in ipairs({first,distant,third}) do
-                    local route=Strategy.land_route(point,id)
-                    local covered=false
-                    for _,structure in pairs(state.structures or {}) do
-                        if structure.ownerId==id and structure.kind==3 and not structure.uc
-                            and Strategy.distance(point,structure.tile)<=(Config.DEFENSE_POST_RANGE or 30) then covered=true;break end
+                local routeScore=-math.huge
+                local visited={}
+                for _,point in ipairs({best,distant,third}) do
+                    if not visited[point] then
+                        visited[point]=true
+                        local route=Strategy.land_route(point,id)
+                        local covered=Strategy.post_covers(point,id)
+                        local score=Strategy.route_score(route)-(covered and 100 or 0)-bit32.band(buffer.readu8(state.terrain,point),63)
+                        if score>routeScore then routeScore=score;result[id]=point;state.targetProtected[id]=covered end
                     end
-                    local score=Strategy.route_score(route)-(covered and 100 or 0)-bit32.band(buffer.readu8(state.terrain,point),63)
-                    if score>bestScore then bestScore=score;result[id]=point;state.targetProtected[id]=covered end
                 end
             end
         end
@@ -2972,7 +3038,17 @@ end
 function Strategy.finish_strength(enemy)
  local budgetNeed=enemy.troops*(Config.BUDGET_RATIO_MAX or 0.5)/math.max(0.001,2*(Config.SPEED_RATIO_DIV or 5))
  local tileCostNeed=enemy.troops/math.max(0.001,(Config.SPEED_RATIO_DIV or 5)*(Config.SPEED_RATIO_MIN or 0.2))
- return math.max(Config.MIN_ATTACK_TROOPS or 250,budgetNeed,tileCostNeed)*1.25
+ local landNeed=0
+ local me=state.players[state.id]
+ local tile=enemy.id and Strategy.land_target(enemy.id)
+ if tile and me then
+  local estimate=Strategy.combat_estimate(enemy.id,tile,math.max(1,me.troops*Strategy.minimum_ratio()))
+  if estimate then
+   local horizon=math.min(4096,math.max(0,(enemy.tiles or 0)-(Config.DEAD_DEFENDER_TILES or 100)+1))
+   landNeed=estimate.lossPerTile*horizon
+  end
+ end
+ return math.max(Config.MIN_ATTACK_TROOPS or 250,budgetNeed,tileCostNeed,landNeed)*1.25
 end
 function Strategy.finish_ratio(id,field,stalled)
  local me,enemy=state.players[state.id],state.players[id]
@@ -2983,7 +3059,7 @@ function Strategy.finish_ratio(id,field,stalled)
  if not allowed then return nil end
  local gap=math.max(Config.MIN_ATTACK_TROOPS or 250,need-field)
  local best=nil
- for _,preset in ipairs(Config.attackPresets(state.mode)) do
+ for _,preset in ipairs(Strategy.attack_choices(gap)) do
   local sent=math.floor(me.troops*preset)
   if preset<=0.50 and sent>=gap and me.troops-sent>=(reserve or 0) and (not best or preset<best) then best=preset end
  end
@@ -2998,17 +3074,6 @@ function Strategy.land_front_limit()
   limit=math.min(limit,denied.active)
  elseif denied then state.frontLimitDenied=nil end
  return limit
-end
-function Strategy.human_priority_pending(targets)
-    local humans=Strategy.endgame_humans()
-    if not next(humans) or Strategy.active_orders()>=Strategy.land_front_limit() then return false end
-    local busy={}
-    for _,front in ipairs(state.outgoing) do busy[front.id]=true end
-    for id,pending in pairs(state.riverOrders or {}) do
-        if not pending.failed and pending.untilTime>os.clock() then busy[id]=true end
-    end
-    for id in pairs(humans) do if targets[id] and not busy[id] then return true end end
-    return false
 end
 function Strategy.observe_counter_window(previous,current)
     state.counterWindows=state.counterWindows or {}
@@ -3062,14 +3127,13 @@ function Strategy.try_counter_finish(targets)
             local field=0
             for _,front in ipairs(state.outgoing) do if front.id==id then field+=front.troops end end
             local need=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*1.2)
-            local limited=enemy.troops<=me.troops*0.125
-            local reserve=limited and me.troops*0.85 or hold
+            local reserve=hold
             local freeSlot=field>0 or Strategy.active_orders()<Strategy.land_front_limit()
             local route=options.routeAwareTargets and Strategy.land_route(tile,id) or nil
             if freeSlot and field<need and (not route or not route.fragment) then
                 for _,ratio in ipairs(Strategy.attack_choices(need-field)) do
                     local troops=math.floor(me.troops*ratio)
-                    if ratio<=(limited and 0.15 or 0.35) and troops>=need-field and me.troops-troops>=reserve then
+                    if ratio<=0.35 and troops>=need-field and me.troops-troops>=reserve then
                         local score=(Strategy.is_real_human(id,enemy) and 100000 or 0)+Strategy.city_value(id)*1000-enemy.troops/math.max(1,me.troops)*100
                         if not best or score>best.score or (id==best.id and ratio<best.ratio) then
                             best={id=id,tile=tile,ratio=ratio,entry=entry,score=score,hold=reserve}
@@ -3096,7 +3160,7 @@ end
 function Strategy.fast_counter_step()
     if not options.fastDecisions or options.dry or not alive or not state.ready or state.phase~="playing"
         or state.awaitingInit or state.engineFault or (state.protocolBlocks and next(state.protocolBlocks))
-        or not fresh() or os.clock()-state.lastAction<0.75 or not Strategy.counter_finish_pending() then return false end
+        or not fresh() or os.clock()-(state.lastTroopOrder or state.lastAction)<0.35 or not Strategy.counter_finish_pending() then return false end
     local targets={}
     for id,entry in pairs(state.counterWindows or {}) do
         if entry.endedAt and (entry.expiresAt or 0)>os.clock() then targets[id]=Strategy.land_target(id) end
@@ -3171,7 +3235,8 @@ function Strategy.try_land_campaign(targets)
                 local need=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*(covered and 0.65 or 0.35))
                 for _,ratio in ipairs(Strategy.attack_choices(need)) do
                     local committed=math.floor(me.troops*ratio)
-                    if ratio<=0.35 and committed>=need and me.troops-committed>=hold then
+                    if ratio<=0.35 and committed>=need and me.troops-committed>=hold
+                        and Strategy.offensive_budget({t="attack",tile=tile,ratio=ratio},true) then
                         local score=Strategy.target_score(id,tile,0,true)
                         if score and (not best or score>best.score or (best.id==id and ratio<best.ratio)) then
                             best={id=id,tile=tile,ratio=ratio,hold=hold,score=score,area=route.area,capped=route.capped}
@@ -3239,30 +3304,6 @@ function Strategy.front_reinforce_delay(id,me,front,fastFinish,neutralNeed)
         return math.min(options.reinforceDelay,2)
     end
     return options.reinforceDelay
-end
-function Strategy.fast_front_step()
-    if Strategy.counter_finish_pending() then return false end
-    if options.activeDefense and options.defend and #state.incoming>0 then return false end
-    if not options.fastFrontReinforce or not options.reinforce or options.dry or not alive or not state.ready
-        or state.phase~="playing" or state.engineFault or state.awaitingInit
-        or (state.protocolBlocks and next(state.protocolBlocks)) or not fresh() or (#state.incoming>0 and not Strategy.contained_attack())
-        or #state.outgoing==0 or os.clock()-state.lastAction<0.5
-        or os.clock()-state.lastAction>=Strategy.action_delay()
-        or state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
-    if Strategy.human_priority_pending(enemy_targets()) then return false end
-    local me=state.players[state.id]
-    if not me or not me.alive then return false end
-    local normalRatio=choose_ratio(false)
-    local normalReserve=state.requiredReserve
-    local economicRatio=choose_ratio(false,true)
-    state.economicReserve=state.requiredReserve;state.requiredReserve=normalReserve
-    local economicReady=Strategy.growth_ready(economicRatio)
-    local before=state.orderSerial or 0
-    state.fastFrontOrder=true
-    local ok,err=pcall(Strategy.try_reinforce,enemy_targets(),normalRatio,economicRatio,economicReady)
-    state.fastFrontOrder=nil
-    if not ok then error(err,0) end
-    return (state.orderSerial or 0)>before
 end
 function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
     if not options.reinforce or #state.outgoing==0 then return false end
@@ -3373,8 +3414,9 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         best.record.tiles=state.players[best.id] and state.players[best.id].tiles
         if state.frontProgress and state.frontProgress[best.id] then state.frontProgress[best.id].at=now end
         state.boosts[best.id]=best.record;state.lastSend=now
+        return true
     end
-    return true
+    return false
 end
 function Strategy.spawn_region(tile)
     local queue,seen={tile},{[tile]=true}
@@ -3531,8 +3573,8 @@ function Strategy.try_cap_recovery(targets)
     if me.troops<cap*0.90 then return false end
     local grace=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
     if os.clock()-(state.playingAt or 0)<grace then return false end
-    local ratio=math.max(0.05,Config.MIN_ATTACK_RATIO or 0.05)
-    if ratio>0.05 then return false end
+    local ratio=Strategy.minimum_ratio()
+    if ratio>0.35 then return false end
     local busy={};for _,front in ipairs(state.outgoing) do busy[front.id]=true end
     local best=nil
     for id,tile in pairs(targets) do
@@ -3554,7 +3596,7 @@ function Strategy.try_cap_recovery(targets)
     local budget=state.neighborBudget
     if not budget or budget.hold<=cap then return false end
     state.capRecoveryOrder=true
-    local ok,sent=pcall(send,{t="attack",tile=best.tile,ratio=ratio},"CAPACITEIT HERSTELLEN: kleine verovering "..best.id.." met 95% leger thuis")
+    local ok,sent=pcall(send,{t="attack",tile=best.tile,ratio=ratio},"CAPACITEIT HERSTELLEN: verovering "..best.id.." met "..math.floor((1-ratio)*100).."% leger thuis")
     state.capRecoveryOrder=nil
     if not ok then error(sent,0) end
     if sent then state.lastSend=os.clock();state.lastCapRecovery=os.clock();return true end
@@ -3679,6 +3721,9 @@ local function state_event(kind,payload,extra)
         state.generation=state.generation+1
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
+        state.structureRevision=0;state.postCache=nil;state.targetCache=nil;state.contactCache=nil
+        state.lastWireAt=-10000;state.capIdleSince=nil;state.capIdleTotal=0;state.plannerStats=nil
+        state.lastStatusAt=-10000;state.landRouteCache=nil
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
         state.frontLimitDenied=nil;state.transportRetryAt=0;state.lastFallbackTransport=-10000;state.blockedAttack={}
         state.rosterUsers={};state.spawnProfile=nil;state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false;state.lastBorderAudit=-10000;state.lastTargetReport=-10000
@@ -3692,14 +3737,14 @@ local function state_event(kind,payload,extra)
         state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
         state.quarantinedAttack={};state.attackOrders={};state.mapRepairPending=false;state.containedDefense=false
         state.humanFinishReason=nil;state.shieldStatus=nil;state.lastHostileMissile=nil;state.defenseOrder=nil;state.defenseGrowth=nil;state.defenseRecovery=nil;state.defenseSpending=nil;state.cautionUntil=nil;state.neighborBudget=nil;state.capRecoveryOrder=nil;state.lastCapRecovery=nil;state.hostileWarheads={};state.defenseBurst=nil;state.lastBorderGuard=nil;state.counterWindows={};state.counterFinishOrder=nil;state.waterSearchToken=nil
-        state.nukePending=nil;state.nukeBudgetAfter=nil;state.nukeSalvoCount=0;state.nukeFastBlockedUntil=0;state.fastFrontOrder=nil
+        state.nukePending=nil;state.nukeBudgetAfter=nil;state.nukeSalvoCount=0;state.nukeFastBlockedUntil=0
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
         local roster=message_list("roster",payload.roster or {},false)
         for _,entry in ipairs(roster or {}) do state.rosterUsers[entry.i]=entry.u end
         state.capBonus=payload.troopCapBonus or 0
         state.players={}; state.allies={}; state.incoming={}; state.outgoing={}
-        state.frontier={}; state.representatives={}; state.pending={}
+        state.frontier={};state.frontierGroups={};state.frontierOwner={}; state.representatives={}; state.pending={}
         state.owners=buffer.create(N); state.terrain=nil; state.ready=false
         state.waitingDimensions=true;state.deferredStructures={};state.snapshotComplete=false;state.snapshotCovered=0
         state.snapshotReady=false; state.snapshot=nil; state.chunks={}; state.seen=0
@@ -3801,6 +3846,7 @@ local function state_event(kind,payload,extra)
         end
         if extra then state.structuresReady=true end
         state.cityCache=nil
+        state.structureRevision=(state.structureRevision or 0)+1
     elseif kind=="built" then
         state.errorCount=0;state.gold=payload.gold or state.gold
         if payload.kind==1 then state.cityCost=payload.cost or state.cityCost
@@ -3862,7 +3908,13 @@ local function state_event(kind,payload,extra)
             state.frontLimitDenied={active=#state.outgoing,retryAt=os.clock()+10}
             Recorder.emit("front_limit_denied",state.frontLimitDenied)
         end
-        state.lastAction=payload.reason=="own" and (os.clock()-options.interval) or (os.clock()+5)
+        if command and command.t=="attack" then
+            local tile=payload.tile or command.tile
+            if type(tile)=="number" then
+                state.blockedAttack[tile]=os.clock()+(payload.reason=="immunity" and 2 or 1)
+            end
+        end
+        state.lastAction=math.min(state.lastAction,os.clock())
         if state.errorCount>=4 then
             state.engineFault="Vier onverwachte serverweigeringen; stuur Foutlog. Instellingen behouden."
             log(state.engineFault)
@@ -3924,19 +3976,22 @@ local function run_step_inner()
         end
     end
     local me=state.players[state.id]
-    local warnings={}
-    for kind in pairs(state.protocolWarnings or {}) do warnings[#warnings+1]=kind end
-    table.sort(warnings)
-    status.Text=string.format("Server: %s | %s\nKaart: %s | Troepen: %s\nInkomend: %d | Uitgaand: %d\nModus: %s\nOpslag: %s\nHerladen: %s\nSterkste buur: %s | Buren: %s\nReserve strijd/economie: %s | Goud: %s\nGroeimodel: %s\nGemeten groei: %s troepen/s\nBerichtwaarschuwingen: %s\nStatus: %s",
-        tostring(role),tostring(state.phase),state.ready and "gereed" or "wachten",
-        me and tostring(me.troops) or "onbekend",#state.incoming,#state.outgoing,
-        options.dry and "OBSERVATIE: GEEN ORDERS" or "ACTIEF",storage_status,
-        options.reload and (state.reloadStatus or "controleren") or "UIT",
-        tostring(state.strongestNeighbour or "?"),tostring(state.neighbourCount or "?"),
-        (tostring(state.requiredReserve or "?").." / "..tostring(state.economicReserve or "?")),tostring(state.gold or "?"),
-        state.economicStatus or "nog geen betrouwbare beoordeling",
-        state.measuredGrowth and string.format("%.1f",state.measuredGrowth) or "meten",
-        #warnings>0 and table.concat(warnings,", ") or "geen",(state.reason or "Initialiseren")..(options.nukes and ("\nNukes: "..(state.nukeReason or "doelen beoordelen")) or "\nNukes: UIT"))
+    if os.clock()-(state.lastStatusAt or -10000)>=0.5 then
+        state.lastStatusAt=os.clock()
+        local warnings={}
+        for kind in pairs(state.protocolWarnings or {}) do warnings[#warnings+1]=kind end
+        table.sort(warnings)
+        status.Text=string.format("Server: %s | %s\nKaart: %s | Troepen: %s\nInkomend: %d | Uitgaand: %d\nModus: %s\nOpslag: %s\nHerladen: %s\nSterkste buur: %s | Buren: %s\nReserve strijd/economie: %s | Goud: %s\nGroeimodel: %s\nGemeten groei: %s troepen/s\nBerichtwaarschuwingen: %s\nStatus: %s",
+            tostring(role),tostring(state.phase),state.ready and "gereed" or "wachten",
+            me and tostring(me.troops) or "onbekend",#state.incoming,#state.outgoing,
+            options.dry and "OBSERVATIE: GEEN ORDERS" or "ACTIEF",storage_status,
+            options.reload and (state.reloadStatus or "controleren") or "UIT",
+            tostring(state.strongestNeighbour or "?"),tostring(state.neighbourCount or "?"),
+            (tostring(state.requiredReserve or "?").." / "..tostring(state.economicReserve or "?")),tostring(state.gold or "?"),
+            state.economicStatus or "nog geen betrouwbare beoordeling",
+            state.measuredGrowth and string.format("%.1f",state.measuredGrowth) or "meten",
+            #warnings>0 and table.concat(warnings,", ") or "geen",(state.reason or "Initialiseren")..(options.nukes and ("\nNukes: "..(state.nukeReason or "doelen beoordelen")) or "\nNukes: UIT"))
+    end
     if state.engineFault then
         state.reason="Gepauzeerd na fout; instellingen behouden. Gebruik Synchroniseer opnieuw."
         status.Text=state.engineFault
@@ -4043,8 +4098,8 @@ local function run_step_inner()
     if Strategy.try_shield() then return end
     if Strategy.try_cap_recovery(targets) then return end
     if Strategy.try_finish_humans(targets) then return end
-    if Strategy.try_land_campaign(targets) then return end
     if Strategy.quick_campaign(targets) then return end
+    if Strategy.try_land_campaign(targets) then return end
     local mapGeneration=state.generation
     local beforeRouteOrder=state.orderSerial or 0
     Strategy.refresh_water_targets()
@@ -4108,7 +4163,13 @@ local function run_step_inner()
             if Strategy.water_order(id,entry,allowed,targets,occupied) then waterOpportunity=true;break end
         end
     end
-    if not waterOpportunity and not parallelOpportunity and not growthPriority and not harvestPriority and not treasurePriority and Strategy.try_build(false) then return end
+    if not waterOpportunity and not parallelOpportunity and not growthPriority and not harvestPriority and not treasurePriority then
+        local reinforcementReserve=state.requiredReserve
+        local reinforcementRatio=choose_ratio(false,true)
+        state.economicReserve=state.requiredReserve;state.requiredReserve=reinforcementReserve
+        if Strategy.try_reinforce(targets,ratio,reinforcementRatio,Strategy.growth_ready(reinforcementRatio)) then return end
+        if Strategy.try_build(false) then return end
+    end
     local normalReserve=state.requiredReserve
     local economicRatio=choose_ratio(false,true)
     local economicReserve=state.requiredReserve
@@ -4249,6 +4310,8 @@ function Recorder.sample()
  Recorder.emit("world",{players=summaries,selfId=state.id,phase=state.phase,mapId=state.mapId,
   width=W,height=H,mapRevision=state.mapRevision,ready=state.ready,
   gold=state.gold,capacity=me and Strategy.capacity(me),measuredGrowth=state.measuredGrowth,
+  planner=state.plannerStats,capSeconds=(state.capIdleTotal or 0)+(state.capIdleSince and os.clock()-state.capIdleSince or 0),
+  legalRatios=Config.attackPresets(state.mode),
   ownLossRate=state.homeLossRate,allies=state.allies,teams=state.teams,
   incoming=state.incoming,outgoing=state.outgoing,
   costs={city=state.cityCost,defense=state.postCost,sam=state.samCost,reinforce=state.reinforceCost},
@@ -4375,23 +4438,31 @@ end
 
 local function run_step()
     local stepStarted=os.clock()
+    local capMe=state.players[state.id]
+    local capped=state.phase=="playing" and capMe and capMe.alive and capMe.troops>=Strategy.capacity(capMe)*0.95
+    if capped then state.capIdleSince=state.capIdleSince or stepStarted
+    elseif state.capIdleSince then
+        state.capIdleTotal=(state.capIdleTotal or 0)+stepStarted-state.capIdleSince;state.capIdleSince=nil
+    end
     state.planContext={}
     local before=state.orderSerial or 0
     local ok,result=xpcall(function()
         Strategy.repair_map_if_needed()
-        if not Strategy.emergency_defense_step() and not Strategy.fast_front_step() then run_step_inner() end
-        if state.phase=="playing" then Strategy.target_diagnostics() end
+        if not Strategy.emergency_defense_step() and not Strategy.fast_counter_step() then run_step_inner() end
+        if state.phase=="playing" and not state.awaitingInit and not state.engineFault then Strategy.target_diagnostics() end
         if (state.orderSerial or 0)==before and Strategy.interleave_ready("build") then
             if #state.incoming>0 then Strategy.try_build(true)
             elseif not Strategy.try_shield() then Strategy.try_build(false) end
         end
     end,debug.traceback)
     state.contactScansLast=(state.planContext and state.planContext.scans) or 0
+    local stats=state.plannerStats or {steps=0,total=0,maximum=0}
+    local duration=os.clock()-stepStarted
+    stats.steps+=1;stats.total+=duration;stats.maximum=math.max(stats.maximum,duration)
+    state.plannerStats=stats
     if options.recordData and (not ok or os.clock()-stepStarted>=0.1) then
         Recorder.emit("planner_timing",{duration=os.clock()-stepStarted,success=ok,contactScans=state.contactScansLast,error=not ok and tostring(result) or nil})
     end
-    local telemetryOk,telemetryError=pcall(Recorder.tick)
-    if not telemetryOk then Recorder.error="Telemetrie: "..tostring(telemetryError);Recorder.render() end
     state.planContext=nil
     if not ok then error(result,0) end
     return result
@@ -4483,5 +4554,16 @@ task.spawn(guard(function()
             task.wait(0.25)
         end
     end)
-    while alive do guard(run_step)(); task.wait(0.5) end
+    local safeStep=guard(run_step)
+    while alive do
+        local now=os.clock()
+        local changed=state.lastPlanPlayers~=state.lastPlayers or state.lastPlanFronts~=state.lastFronts
+            or state.lastPlanRevision~=state.mapRevision or state.lastPlanStructures~=state.structureRevision
+        if not options.fastDecisions or changed or now-(state.lastPlanAt or -10000)>=0.25 then
+            state.lastPlanPlayers=state.lastPlayers;state.lastPlanFronts=state.lastFronts
+            state.lastPlanRevision=state.mapRevision;state.lastPlanStructures=state.structureRevision;state.lastPlanAt=now
+            safeStep()
+        end
+        task.wait(options.fastDecisions and 0.05 or 0.5)
+    end
 end))
