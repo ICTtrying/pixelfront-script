@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.4-city-economy"
+local VERSION="6.4.1-opening-savings"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- protect=true,cities=true,cityBursts=true,smartCityUpgrades=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
+ protect=true,cities=true,cityBursts=true,saveCityOpening=true,smartCityUpgrades=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -607,8 +607,9 @@ local ui_ok,ui_error=xpcall(function()
  number_input("Instellen","Actievertraging in seconden","interval",2,30)
  toggle("Instellen","Veilige steden upgraden","upgradeCities")
  toggle("Instellen","Goedkope steden in bouwreeks plaatsen","cityBursts")
+ toggle("Instellen","Eerst sparen voor drie startsteden","saveCityOpening")
  toggle("Instellen","Goedkope stadsupgrades voorrang geven","smartCityUpgrades")
- label("Instellen","Bouwreeksen plaatsen maximaal drie steden met serverbevestiging per order. Bij prijswijziging, dreiging of ontbrekende bevestiging stopt de reeks. Goudreserve en stedenlimiet blijven gelden. Reinforcement houdt zijn serverwachttijd.",110)
+ label("Instellen","Bij de start eerst sparen voor drie betaalbare steden (bij 25k: 75k), als er genoeg bouwruimte is. Bouwreeksen plaatsen maximaal drie steden met serverbevestiging per order. Bij prijswijziging, dreiging of ontbrekende bevestiging stopt de reeks. Goudreserve en stedenlimiet blijven gelden. Reinforcement houdt zijn serverwachttijd.",110)
  number_input("Instellen","Goud achterhouden","goldReserve",0,10000000)
  number_input("Instellen","Maximaal aantal steden","maxCities",1,40)
  number_input("Instellen","Maximaal stadsniveau","maxCityLevel",1,10)
@@ -733,7 +734,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.4")
+]=],snapshot,RAW_URL.."?v=6.4.1")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1941,6 +1942,20 @@ function Strategy.finish_city_burst(reason)
     Recorder.emit("city_burst_end",{reason=reason,confirmed=burst.confirmed,planned=#burst.tiles,cost=burst.cost})
     log("Bouwreeks: "..tostring(burst.confirmed).."/"..#burst.tiles.." bevestigd; "..reason)
 end
+function Strategy.city_opening_goal(tile,cost,free,count)
+    if not options.saveCityOpening or not options.cityBursts or free or count~=0
+        or type(cost)~="number" or cost<=0 or #state.incoming>0 then return nil end
+    local duration=(Config.CITY_BUILD_TICKS or 20)/(Config.TICK_RATE or 10)
+    if duration<=0.5 then return nil end
+    local tiles={tile}
+    for i=2,math.min(3,options.maxCities) do
+        local nextTile=Strategy.build_spot(1,tiles)
+        if not nextTile then break end
+        tiles[#tiles+1]=nextTile
+    end
+    if #tiles<2 then return nil end
+    return #tiles*cost,#tiles
+end
 function Strategy.city_burst_plan(tile,cost,free,count)
     if not options.cityBursts or options.dry or free or type(cost)~="number" or cost<=0
         or #state.incoming>0 or not state.gold then return nil end
@@ -2045,7 +2060,7 @@ function Strategy.try_build(defensive)
         if enemy and enemy.isBot~=true and (c.troops>=me.troops*0.35 or (state.levels or 0)>=3) then highThreat=true end
         if c.troops*Strategy.threat_factor(id)>=me.troops*0.8 then highThreat=true end
     end
-    state.cityBuildPlan=nil;state.cityUpgradePlanned=false
+    state.cityBuildPlan=nil;state.cityUpgradePlanned=false;state.citySavings=nil
     local kind,tile,cost,free=nil,nil,nil,false
     if options.posts and highThreat then
         local posts=0
@@ -2065,7 +2080,22 @@ function Strategy.try_build(defensive)
         for _,s in pairs(state.structures) do if s.ownerId==state.id and buffer.readu8(state.owners,s.tile)==state.id and s.kind==1 then table.insert(cities,s) end end
         cost=state.cityCost;free=(state.freeCities or 0)>0;kind=1
         local placement=nil
-        if #cities<options.maxCities and Strategy.city_affordable(cost,free,#cities,defensive) then placement=Strategy.build_spot(1) end
+        local opening=options.saveCityOpening and options.cityBursts and #cities==0
+            and type(cost)=="number" and cost>0
+        if #cities<options.maxCities and (opening or Strategy.city_affordable(cost,free,#cities,defensive)) then placement=Strategy.build_spot(1) end
+        if placement then
+            local goal,total=Strategy.city_opening_goal(placement,cost,free,#cities)
+            if goal and state.gold<goal then
+                state.citySavings={goal=goal,cities=total,price=cost,gold=state.gold}
+                state.reason="STARTSPAREN: "..math.floor(state.gold).." / "..math.floor(goal).." goud voor "..total.." steden"
+                if os.clock()-(state.lastCitySavingsLog or -10000)>=10 then
+                    log(state.reason);state.lastCitySavingsLog=os.clock()
+                    Recorder.emit("city_opening_savings",state.citySavings)
+                end
+                return false
+            end
+            if not Strategy.city_affordable(cost,free,#cities,defensive) then placement=nil end
+        end
         local upgrade=nil
         if type(cost)=="number" and state.gold-cost>=options.goldReserve then upgrade=Strategy.city_upgrade(cities) end
         local burst=placement and Strategy.city_burst_plan(placement,cost,free,#cities) or nil
@@ -2614,7 +2644,7 @@ local function state_event(kind,payload,extra)
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
-        state.cityBurst=nil;state.cityBuildPlan=nil;state.cityUpgradePlanned=false
+        state.cityBurst=nil;state.cityBuildPlan=nil;state.cityUpgradePlanned=false;state.citySavings=nil;state.lastCitySavingsLog=nil
         state.blockedBuild={};state.plannedBlasts={};state.gold=nil;state.cityCost=nil;state.postCost=nil
         state.freeCities=0;state.freePosts=0;state.freeNukes=0;state.freeSams=0;state.samCost=nil
         state.reinforceCost=nil;state.reinforceTroops=nil;state.reinforceQuoteAt=nil
@@ -3270,7 +3300,8 @@ function Recorder.install_workers()
     or system=="Economie" and (options.cities or options.posts or options.sams)
     or system=="Verdediging" and options.defend or system=="Versterken" and (options.reinforce or options.buyReinforcements)
    local detail=system=="Nukes" and state.nukeReason or system=="Routes" and state.waterSearchInfo
-    or system=="Verdediging" and state.counterReason or method
+    or system=="Verdediging" and state.counterReason
+    or system=="Economie" and state.citySavings and ("Startspaarpot: "..math.floor(state.citySavings.gold).." / "..math.floor(state.citySavings.goal).." goud") or method
    Recorder.system(system,acted and "order verstuurd" or enabled and "beoordeeld" or "uit",detail)
    if options.recordData and (acted or os.clock()-(Recorder.lastByKind[method] or -100)>=2) then
     Recorder.lastByKind[method]=os.clock()
