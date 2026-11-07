@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.19-counter-finish"
+local VERSION="6.20-fast-counter"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- counterFinish=true,balancedShield=true,borderGuard=true,sustainedDefense=true,combatAware=true,preciseOrders=true,layeredSams=true,attritionAware=true,capRecovery=true,neighborReserve=true,growthDefense=true,adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
+ fastDecisions=true,counterFinish=true,balancedShield=true,borderGuard=true,sustainedDefense=true,combatAware=true,preciseOrders=true,layeredSams=true,attritionAware=true,capRecovery=true,neighborReserve=true,growthDefense=true,adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -586,6 +586,7 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Kleine capaciteitsgroei bij onhaalbare reserve","capRecovery")
  toggle("Oorlog","Laatste zwakke menselijke tegenstanders eerst","finishHumans")
  toggle("Oorlog","Verzwakte aanvaller na verdediging afmaken","counterFinish")
+ toggle("Oorlog","Snelle kansencontrole en waterzoeken op achtergrond","fastDecisions")
  toggle("Oorlog","Bereikbare hoofdmacht boven losse landstukjes","routeAwareTargets")
  toggle("Oorlog","Gecontroleerd aanvallen bij bruikbaar overwicht","adaptiveLandCampaign")
  toggle("Oorlog","Steden bouwen","cities")
@@ -750,7 +751,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.19",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.20",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1748,7 +1749,7 @@ function Strategy.water_targets()
         end)
         if head%1024==0 then
             task.wait()
-            if not alive or generation~=state.generation then return {} end
+            if not alive or generation~=state.generation or not options.rivers then return {} end
             if state.phase=="playing" and #state.incoming>0 and not Strategy.contained_attack() then
                 state.waterSearchInfo="Waterzoektocht onderbroken: inkomende aanval"
                 return state.waterTargets or {}
@@ -1763,6 +1764,23 @@ function Strategy.water_targets()
     end
     state.waterCandidates=candidates;state.waterTargets=targets
     return targets
+end
+function Strategy.refresh_water_targets()
+    if not options.fastDecisions or not options.rivers then return Strategy.water_targets() end
+    if not state.ready or state.phase~="playing" then return state.waterTargets or {} end
+    local token=state.waterSearchToken
+    if token and token.generation==state.generation then return state.waterTargets or {} end
+    if os.clock()-(state.lastWaterScan or -10000)<6 then return state.waterTargets or {} end
+    token={generation=state.generation};state.waterSearchToken=token
+    task.spawn(function()
+        if not alive or token.generation~=state.generation then return end
+        local ok,err=pcall(Strategy.water_targets)
+        if state.waterSearchToken==token then
+            state.waterSearchToken=nil
+            if not ok then state.lastWaterScan=os.clock();log("Waterzoeker: "..tostring(err)) end
+        end
+    end)
+    return state.waterTargets or {}
 end
 function Strategy.water_order(id,entry,attacksAllowed,targets,busy)
     local me,enemy=state.players[state.id],state.players[id]
@@ -2288,6 +2306,19 @@ function Strategy.offensive_budget(payload)
     if me.troops-spent<hold then
         local owner=buffer.readu8(state.owners,payload.tile)
         local enemy=state.players[owner]
+        local window=state.counterWindows and state.counterWindows[owner]
+        local smallLimit=strongest>me.troops*3 and 0.05 or 0.15
+        local gain=Strategy.growth_model(me.troops-spent,cap)
+        if options.counterFinish and state.counterFinishOrder==owner and land and #state.incoming==0
+            and window and window.endedAt and (window.expiresAt or 0)>os.clock()
+            and enemy and enemy.alive and enemy.troops<=me.troops*0.125
+            and spent<=me.troops*(smallLimit+0.00001) and me.troops-spent>=me.troops*0.85
+            and gain>=Strategy.growth_model(me.troops,cap)*0.88 then
+            Recorder.emit("counter_reserve_exception",{id=owner,spent=spent,remaining=me.troops-spent,normalHold=hold})
+            return true
+        end
+        local owner=buffer.readu8(state.owners,payload.tile)
+        local enemy=state.players[owner]
         local cheap=owner==0 or (enemy and enemy.alive and enemy.troops<=me.troops*0.08 and spent>=enemy.troops*0.65)
         if options.capRecovery and state.capRecoveryOrder and hold>cap and land and #state.incoming==0
             and me.troops>=cap*0.90 and spent<=me.troops*0.05001 and me.troops-spent>=cap*0.85 and cheap then
@@ -2301,6 +2332,7 @@ function Strategy.offensive_budget(payload)
     return true
 end
 function Strategy.order_ready(kind)
+    if kind=="attack" and state.counterFinishOrder and options.fastDecisions then return os.clock()-state.lastAction>=0.75 end
     if kind=="attack" and state.defenseOrder and options.defend and options.activeDefense then return os.clock()-state.lastAction>=0.5 end
     if kind=="attack" and state.fastFrontOrder and options.fastFrontReinforce then
         return os.clock()-state.lastAction>=0.5
@@ -3029,16 +3061,18 @@ function Strategy.try_counter_finish(targets)
             and not friendly(id) and me.troops>=enemy.troops*3 then
             local field=0
             for _,front in ipairs(state.outgoing) do if front.id==id then field+=front.troops end end
-            local need=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*1.5)
+            local need=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*1.2)
+            local limited=enemy.troops<=me.troops*0.125
+            local reserve=limited and me.troops*0.85 or hold
             local freeSlot=field>0 or Strategy.active_orders()<Strategy.land_front_limit()
             local route=options.routeAwareTargets and Strategy.land_route(tile,id) or nil
             if freeSlot and field<need and (not route or not route.fragment) then
                 for _,ratio in ipairs(Strategy.attack_choices(need-field)) do
                     local troops=math.floor(me.troops*ratio)
-                    if ratio<=0.35 and troops>=need-field and me.troops-troops>=hold then
+                    if ratio<=(limited and 0.15 or 0.35) and troops>=need-field and me.troops-troops>=reserve then
                         local score=(Strategy.is_real_human(id,enemy) and 100000 or 0)+Strategy.city_value(id)*1000-enemy.troops/math.max(1,me.troops)*100
                         if not best or score>best.score or (id==best.id and ratio<best.ratio) then
-                            best={id=id,tile=tile,ratio=ratio,entry=entry,score=score,hold=hold}
+                            best={id=id,tile=tile,ratio=ratio,entry=entry,score=score,hold=reserve}
                         end
                     end
                 end
@@ -3048,12 +3082,26 @@ function Strategy.try_counter_finish(targets)
     if not best then return false end
     local tile=Strategy.land_target(best.id,best.tile)
     if not tile then return false end
-    if send({t="attack",tile=tile,ratio=best.ratio},"DOORPAKKEN NA VERDEDIGING: verzwakte aanvaller "..best.id.." | thuisreserve "..math.ceil(best.hold)) then
+    state.counterFinishOrder=best.id
+    local ok,sent=pcall(send,{t="attack",tile=tile,ratio=best.ratio},"DOORPAKKEN NA VERDEDIGING: verzwakte aanvaller "..best.id.." | thuisreserve "..math.ceil(best.hold))
+    state.counterFinishOrder=nil
+    if not ok then error(sent,0) end
+    if sent then
         state.lastSend=os.clock();best.entry.lastAttempt=os.clock();best.entry.attempts=(best.entry.attempts or 0)+1
         Recorder.emit("counter_finish",{id=best.id,ratio=best.ratio,hold=best.hold})
         return true
     end
     return false
+end
+function Strategy.fast_counter_step()
+    if not options.fastDecisions or options.dry or not alive or not state.ready or state.phase~="playing"
+        or state.awaitingInit or state.engineFault or (state.protocolBlocks and next(state.protocolBlocks))
+        or not fresh() or os.clock()-state.lastAction<0.75 or not Strategy.counter_finish_pending() then return false end
+    local targets={}
+    for id,entry in pairs(state.counterWindows or {}) do
+        if entry.endedAt and (entry.expiresAt or 0)>os.clock() then targets[id]=Strategy.land_target(id) end
+    end
+    return Strategy.try_counter_finish(targets)
 end
 function Strategy.try_finish_humans(targets)
     if (#state.incoming>0 and not Strategy.contained_attack()) or not fresh() or not state.ready or state.phase~="playing" then return false end
@@ -3643,7 +3691,7 @@ local function state_event(kind,payload,extra)
         state.boxedSince=nil;state.lastBreakoutAt=nil;state.breakout=nil
         state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
         state.quarantinedAttack={};state.attackOrders={};state.mapRepairPending=false;state.containedDefense=false
-        state.humanFinishReason=nil;state.shieldStatus=nil;state.lastHostileMissile=nil;state.defenseOrder=nil;state.defenseGrowth=nil;state.defenseRecovery=nil;state.defenseSpending=nil;state.cautionUntil=nil;state.neighborBudget=nil;state.capRecoveryOrder=nil;state.lastCapRecovery=nil;state.hostileWarheads={};state.defenseBurst=nil;state.lastBorderGuard=nil;state.counterWindows={}
+        state.humanFinishReason=nil;state.shieldStatus=nil;state.lastHostileMissile=nil;state.defenseOrder=nil;state.defenseGrowth=nil;state.defenseRecovery=nil;state.defenseSpending=nil;state.cautionUntil=nil;state.neighborBudget=nil;state.capRecoveryOrder=nil;state.lastCapRecovery=nil;state.hostileWarheads={};state.defenseBurst=nil;state.lastBorderGuard=nil;state.counterWindows={};state.counterFinishOrder=nil;state.waterSearchToken=nil
         state.nukePending=nil;state.nukeBudgetAfter=nil;state.nukeSalvoCount=0;state.nukeFastBlockedUntil=0;state.fastFrontOrder=nil
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
@@ -3999,7 +4047,7 @@ local function run_step_inner()
     if Strategy.quick_campaign(targets) then return end
     local mapGeneration=state.generation
     local beforeRouteOrder=state.orderSerial or 0
-    Strategy.water_targets()
+    Strategy.refresh_water_targets()
     if beforeRouteOrder~=(state.orderSerial or 0) then state.reason="Routeplan herzien na tussentijdse verdedigingsorder";return end
     if mapGeneration~=state.generation or not state.ready or not fresh() or (#state.incoming>0 and not Strategy.contained_attack()) then return end
     if Strategy.try_buy_reinforcements() then return end
@@ -4426,7 +4474,9 @@ task.spawn(guard(function()
     end)
     task.spawn(function()
         while alive do
-            local ok,err=pcall(Strategy.emergency_defense_step)
+            local ok,err=pcall(function()
+                if not Strategy.emergency_defense_step() then Strategy.fast_counter_step() end
+            end)
             if not ok and os.clock()-(state.lastDefenseWorkerError or -10000)>10 then
                 state.lastDefenseWorkerError=os.clock();log("Verdedigingscontrole: "..tostring(err))
             end
