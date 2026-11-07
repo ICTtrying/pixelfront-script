@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.13-neighbor-reserve"
+local VERSION="6.14-connected-spawn"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -741,7 +741,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.13",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.14",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -2203,15 +2203,16 @@ function Strategy.offensive_budget(payload)
         end
     end
     local cap=Strategy.capacity(me)
-    local cautious=strongest>=me.troops*0.85
-    if cautious then state.cautionUntil=os.clock()+8 end
-    local recovering=(state.cautionUntil or 0)>os.clock() and strongest>me.troops/1.20
-    if not cautious and not recovering then return true end
-    local hold=math.max(strongest*1.05+second*0.15,cap*Strategy.growth_peak(cap)*0.75,me.troops*0.75)
     local land=false
     neighbours(payload.tile,function(other) if buffer.readu8(state.owners,other)==state.id then land=true end end)
     local spent=land and math.floor(me.troops*payload.ratio)
         or math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
+    local remaining=me.troops-spent
+    local cautious=strongest>=me.troops*0.85 or strongest>=remaining*0.85
+    if cautious then state.cautionUntil=os.clock()+8 end
+    local recovering=(state.cautionUntil or 0)>os.clock() and strongest>remaining/1.20
+    if not cautious and not recovering then return true end
+    local hold=math.max(strongest*1.05+second*0.15,cap*Strategy.growth_peak(cap)*0.75,me.troops*0.75)
     state.neighborBudget={strongest=strongest,second=second,hold=hold,remaining=me.troops-spent,cautious=true}
     if me.troops-spent<hold then
         state.reason="LEGER OPBOUWEN: sterke buur "..math.ceil(strongest).." | thuisreserve "..math.ceil(hold)
@@ -2660,6 +2661,9 @@ function Strategy.defense_ratio(id)
     local spending=state.defenseSpending
     if partial and spending and os.clock()-spending.at<5
         and spending.spent+math.floor(me.troops*partial)>spending.baseline*(critical and 0.35 or 0.20) then partial=nil end
+    if complete and recovery and os.clock()-recovery.at<4 and me.troops<cap*0.20
+        and me.troops*(1-complete)<me.troops*0.85 then complete=nil end
+    if partial and me.troops<cap*0.20 and recovery and os.clock()-recovery.at<5 then partial=nil end
     local selected=complete or partial
     state.defenseGrowth={capacity=cap,peak=peak,floor=growthFloor,critical=critical,incoming=total,
         currentGrowth=rate,homeLossRate=loss,ratio=selected,
@@ -3097,6 +3101,41 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
     end
     return true
 end
+function Strategy.spawn_region(tile)
+    local queue,seen={tile},{[tile]=true}
+    local sx,sy=tile%W,math.floor(tile/W)
+    local area,terrain,water,hostile=0,0,0,0
+    local directions={false,false,false,false}
+    local head=1
+    while head<=#queue do
+        local point=queue[head];head+=1;area+=1
+        local x,y=point%W,math.floor(point/W)
+        terrain+=bit32.band(buffer.readu8(state.terrain,point),63)
+        if x<sx-24 then directions[1]=true end;if x>sx+24 then directions[2]=true end
+        if y<sy-24 then directions[3]=true end;if y>sy+24 then directions[4]=true end
+        neighbours(point,function(other)
+            if not seen[other] then
+                seen[other]=true
+                local dx,dy=other%W-sx,math.floor(other/W)-sy
+                if math.abs(dx)<=96 and math.abs(dy)<=96 then
+                    if not passable(other) then water+=1
+                    else
+                        local owner=buffer.readu8(state.owners,other)
+                        if owner==0 or owner==state.id then
+                            if #queue<8000 then queue[#queue+1]=other end
+                        else
+                            local user=state.rosterUsers and state.rosterUsers[owner]
+                            hostile+=type(user)=="number" and user>0 and 4 or 1
+                        end
+                    end
+                end
+            end
+        end)
+    end
+    local exits=0;for _,v in ipairs(directions) do if v then exits+=1 end end
+    return {area=area,capped=#queue>=8000,exits=exits,water=water,hostile=hostile,
+        score=math.sqrt(area)*18+exits*120-terrain/math.max(1,area)*8-water*0.5-hostile*5}
+end
 function Strategy.spawn_score(tile)
     if not tile or tile<0 or tile>=N or not passable(tile) then return nil end
     local owner=buffer.readu8(state.owners,tile)
@@ -3107,7 +3146,8 @@ function Strategy.spawn_score(tile)
         if id~=state.id and buffer.readu8(state.owners,other)==id then
             local distance=math.abs(x-other%W)+math.abs(y-math.floor(other/W))
             nearest=math.min(nearest,distance)
-            local human=state.rosterUsers[id]~=nil or (state.players[id] and state.players[id].isBot~=true)
+            local user=state.rosterUsers[id]
+            local human=type(user)=="number" and user>0
             if distance<140 then crowding+=(140-distance)*(human and 2 or 0.6) end
         end
     end
@@ -3236,16 +3276,31 @@ local function choose_spawn()
         return best
     end
     local best=state.spawnTile
-    local bestScore=Strategy.spawn_score(best) or -math.huge
+    local bestScore=-math.huge
     local rng=Random.new()
-    for attempt=1,400 do
-        local tile=rng:NextInteger(0,N-1)
+    local finalists={}
+    local function consider(tile)
         local score=Strategy.spawn_score(tile)
-        if score and score>bestScore then best,bestScore=tile,score end
+        if score then
+            finalists[#finalists+1]={tile=tile,score=score}
+            table.sort(finalists,function(a,b) return a.score>b.score end)
+            if #finalists>10 then table.remove(finalists) end
+        end
+    end
+    if best then consider(best) end
+    for attempt=1,400 do
+        consider(rng:NextInteger(0,N-1))
         if attempt%80==0 then task.wait() end
     end
+    for _,candidate in ipairs(finalists) do
+        local profile=Strategy.spawn_region(candidate.tile)
+        local score=candidate.score+profile.score
+        if profile.area>=512 and score>bestScore then best,bestScore=candidate.tile,score;state.spawnProfile=profile end
+    end
+    if not best and finalists[1] then best=finalists[1].tile end
     if state.spawnTile and best~=state.spawnTile then
         local current=Strategy.spawn_score(state.spawnTile)
+        if current then current+=Strategy.spawn_region(state.spawnTile).score end
         if current and bestScore-current<math.max(100,math.abs(current)*0.18) then return state.spawnTile end
     end
     return best
@@ -3309,7 +3364,7 @@ local function state_event(kind,payload,extra)
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
         state.frontLimitDenied=nil;state.transportRetryAt=0;state.lastFallbackTransport=-10000;state.blockedAttack={}
-        state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false;state.lastBorderAudit=-10000;state.lastTargetReport=-10000
+        state.rosterUsers={};state.spawnProfile=nil;state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false;state.lastBorderAudit=-10000;state.lastTargetReport=-10000
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000;state.waterFailures={};state.waterOwnerRetry={};state.waterStalledAt=nil;state.lastTransportPoll=-10000;state.vehicles={};state.lastVehicles=-10000;state.transportKnown=false
@@ -3928,7 +3983,7 @@ function Recorder.decisions()
   lastAction=state.lastAction,actionDelay=Config and Strategy.action_delay(),
   timeSinceCapture=os.clock()-(state.lastCaptureAt or os.clock()),
   counterReason=state.counterReason,nukeReason=state.nukeReason,humanFinishReason=state.humanFinishReason,containedDefense=state.containedDefense,
-  neighborBudget=state.neighborBudget,defenseGrowth=state.defenseGrowth,shieldStatus=state.shieldStatus,lastHostileMissile=state.lastHostileMissile,waterReason=state.waterSearchInfo,settings=options})
+  spawnProfile=state.spawnProfile,neighborBudget=state.neighborBudget,defenseGrowth=state.defenseGrowth,shieldStatus=state.shieldStatus,lastHostileMissile=state.lastHostileMissile,waterReason=state.waterSearchInfo,settings=options})
 end
 function Recorder.render()
  local lines={}
