@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.21-preset-planner"
+local VERSION="6.22-railgun"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -16,6 +16,7 @@ local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
  fastDecisions=true,counterFinish=true,balancedShield=true,borderGuard=true,sustainedDefense=true,combatAware=true,layeredSams=true,attritionAware=true,capRecovery=true,neighborReserve=true,growthDefense=true,adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
+ railguns=true,buildRailguns=true,maxRailguns=1,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -34,7 +35,7 @@ local function valid_settings(value)
  end
  for key,range in pairs({reserve={10,90},strength={1.2,10},interval={2,30},
   goldReserve={0,10000000},minCluster={2,12},nukeDelay={30,300},maxCities={1,40},
-  maxCityLevel={1,10},buildDelay={5,60},maxFronts={1,4},riverRange={4,48},seaRange={48,512},maxSams={1,32},
+  maxCityLevel={1,10},buildDelay={5,60},maxRailguns={1,4},maxFronts={1,4},riverRange={4,48},seaRange={48,512},maxSams={1,32},
   growthFloor={15,60},reinforceDelay={4,30},maxBoosts={1,5}}) do
   local n=value[key]
   if type(n)=="number" and n==n and n>=range[1] and n<=range[2] then options[key]=n end
@@ -595,6 +596,12 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Eerste antiraketlaag vóór extra grensposten","balancedShield")
  toggle("Oorlog","Gezamenlijk budget voor tegeninzetten","sustainedDefense")
  toggle("Oorlog","Strategische atoomnukes","nukes")
+ toggle("Oorlog","Railguns gericht laten vuren","railguns")
+ toggle("Oorlog","Railguns bouwen bij voldoende economie","buildRailguns")
+ button("Oorlog","Railgunrechten opnieuw controleren",function()
+  state.railFireDenied=false;state.railBuildDenied=false;state.railReason="Rechten opnieuw controleren bij volgende railgunactie"
+ end)
+ label("Oorlog","Railguns richten zich op vijandelijke wapens en gebouwenclusters. De server vereist de railgunpas of een geldige bundel voor schieten; bouwen vereist de pas.",100)
  toggle("Oorlog","Nuke op sterkere huizeneconomie","preemptNukes")
  toggle("Oorlog","Rivieren en zee oversteken","rivers")
  toggle("Oorlog","Anti-nuke bij steden","sams")
@@ -627,6 +634,7 @@ local ui_ok,ui_error=xpcall(function()
  label("Instellen","Nukes blijven afhankelijk van goud, reserve en veilige doelen. Een volgende bom wacht op lancering en nieuw goudsaldo. Reinforcement kopen houdt de serverwachttijd; frontaanvulling verplaatst bestaande troepen.",100)
  number_input("Instellen","Goud achterhouden","goldReserve",0,10000000)
  number_input("Instellen","Maximaal aantal steden","maxCities",1,40)
+ number_input("Instellen","Maximaal aantal railguns","maxRailguns",1,4)
  number_input("Instellen","Maximaal stadsniveau","maxCityLevel",1,10)
  number_input("Instellen","Seconden tussen bouworders","buildDelay",5,60)
  number_input("Instellen","Minimale steden in nukecluster","minCluster",2,12)
@@ -751,7 +759,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.21",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.22",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -2137,6 +2145,10 @@ function Strategy.build_spot(kind)
                         if px>=0 and px<W and py>=0 and py<H and buffer.readu8(state.owners,py*W+px)==state.id then own=own+1 end
                     end
                     if own>=(ownCities<3 and 2 or 4) then score=own*10+groupBonus-danger*80 end
+                elseif kind==21 and danger<0.5 then
+                    local sheltered=true
+                    neighbours(tile,function(other) if buffer.readu8(state.owners,other)~=state.id then sheltered=false end end)
+                    if sheltered then score=100-danger*100+math.min(100,closest)*0.1 end
                 elseif kind==3 then
                     local border=math.huge
                     for _,c in pairs(contacts) do
@@ -2400,6 +2412,7 @@ function Strategy.order_ready(kind)
     local now=os.clock()
     if now-(state.lastWireAt or -10000)<0.15 then return false end
     if options.dry then return now-state.lastAction>=Strategy.action_delay() end
+    if kind=="railgun" then return true end
     if kind=="build" and options.parallelActions then
         return now-(state.lastBuild or -10000)>=math.min(2,options.buildDelay)
     end
@@ -2412,6 +2425,12 @@ function Strategy.order_ready(kind)
     return now-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
 end
 local function send(payload,description)
+    if payload.t=="railgun" then
+        local gun=state.structures and state.structures[payload.from]
+        if not gun or gun.kind~=21 or gun.ownerId~=state.id or gun.uc
+            or buffer.readu8(state.owners,gun.tile)~=state.id
+            or not Strategy.attack_tile_valid(payload.tile) then return false end
+    end
     if payload.t=="attack" then
         if not Strategy.legal_ratio(payload.ratio) then
             Recorder.emit("order_revalidated",{payload=payload,reason="ratio is not a server preset"})
@@ -2482,6 +2501,7 @@ function Strategy.observe_missiles(payload)
     state.hostileWarheads=state.hostileWarheads or {}
     for id,shot in pairs(state.hostileWarheads) do if os.clock()-shot.at>20 then state.hostileWarheads[id]=nil end end
     for _,event in ipairs(payload) do
+        Strategy.rail_event(event)
         if options.layeredSams and type(event)=="table" and event.e=="l" and type(event.owner)=="number"
             and not friendly(event.owner) and type(event.dst)=="number" and event.dst>=0 and event.dst<N
             and state.ready and buffer.readu8(state.owners,event.dst)==state.id then
@@ -2507,6 +2527,148 @@ function Strategy.observe_missiles(payload)
             end
         end
     end
+end
+function Strategy.rail_target()
+    local now=os.clock()
+    local radius=Config.RAILGUN_RADIUS or 5
+    local weights={[1]=3500,[2]=2000,[3]=7000,[4]=12000,[5]=8000,[6]=2000,[18]=10000,[19]=11000,[21]=16000}
+    local structures,candidates={},{}
+    local incoming={}
+    for _,front in ipairs(state.incoming) do incoming[front.id]=true end
+    for _,s in pairs(state.structures or {}) do
+        local enemy=state.players[s.ownerId]
+        if weights[s.kind] and enemy and enemy.alive and not friendly(s.ownerId)
+            and buffer.readu8(state.owners,s.tile)==s.ownerId
+            and (options.attack or (options.defend and incoming[s.ownerId])) then
+            local preserve=options.preserveBotCities and enemy.isBot==true and s.kind==1
+            structures[#structures+1]={structure=s,preserve=preserve}
+            if not preserve and Strategy.attack_tile_valid(s.tile,s.ownerId) then
+                local value=weights[s.kind]*(s.uc and 0.5 or 1)*(incoming[s.ownerId] and 2 or 1)
+                candidates[#candidates+1]={tile=s.tile,value=value}
+            end
+        end
+    end
+    table.sort(candidates,function(a,b) return a.value>b.value or (a.value==b.value and a.tile<b.tile) end)
+    local best=nil
+    for i=1,math.min(64,#candidates) do
+        local candidate=candidates[i]
+        local clear=true
+        for _,shot in pairs(state.railShots or {}) do
+            if shot.untilTime>now and Strategy.distance(candidate.tile,shot.tile)<=radius*2 then clear=false;break end
+        end
+        if clear then
+            local score,hits=0,0
+            for _,entry in ipairs(structures) do
+                local s=entry.structure
+                if Strategy.distance(candidate.tile,s.tile)<=radius then
+                    if entry.preserve then clear=false;break end
+                    score+=weights[s.kind]*(s.uc and 0.5 or 1)*(incoming[s.ownerId] and 2 or 1)
+                    hits+=1
+                end
+            end
+            if clear and (not best or score>best.score) then best={tile=candidate.tile,score=score,hits=hits} end
+        end
+    end
+    return best
+end
+function Strategy.rail_structure(s)
+    if s.kind~=21 then return end
+    state.railReadyAt=state.railReadyAt or {}
+    if s.ownerId~=state.id or (s.level or 0)<=0 then state.railReadyAt[s.tile]=nil;return end
+    local left=type(s.rl)=="number" and math.max(0,s.rl) or 0
+    state.railReadyAt[s.tile]=os.clock()+left/(Config.TICK_RATE or 10)
+end
+function Strategy.rail_event(event)
+    if type(event)~="table" or event.owner~=state.id then return end
+    if event.e=="rf" and type(event.src)=="number" and type(event.dst)=="number" then
+        state.railReadyAt=state.railReadyAt or {}
+        state.railShots=state.railShots or {}
+        local flight=math.max(1,(event.t1 or 0)-(event.t0 or 0))/(Config.TICK_RATE or 10)
+        local key=event.id or event.src
+        state.railShots[key]={tile=event.dst,untilTime=os.clock()+flight+1}
+        local gun=state.structures and state.structures[event.src]
+        local cooldown=gun and gun.rt or Config.RAILGUN_COOLDOWN or 250
+        state.railReadyAt[event.src]=os.clock()+cooldown/(Config.TICK_RATE or 10)
+        if state.railPending and state.railPending.from==event.src then
+            state.railShots["pending"]=nil;state.railPending=nil
+        end
+        Recorder.emit("railgun_confirmed",{from=event.src,tile=event.dst,id=event.id})
+    elseif event.e=="ri" and state.railShots then
+        state.railShots[event.id]=nil
+    end
+end
+function Strategy.rail_denied(payload)
+    if payload.kind~=21 then return end
+    if payload.reason=="pass" then
+        local pending=state.railPending
+        if pending and pending.tile==payload.tile then state.railFireDenied=true
+        else state.railBuildDenied=true end
+        state.railReason="Server weigert railgun: vereiste pas/bundel ontbreekt"
+    end
+    local pending=state.railPending
+    if pending and pending.tile==payload.tile then
+        state.railReadyAt=state.railReadyAt or {}
+        local gun=state.structures and state.structures[pending.from]
+        local retry=payload.reason=="cooldown" and (gun and gun.rt or Config.RAILGUN_COOLDOWN or 250)/(Config.TICK_RATE or 10) or 2
+        state.railReadyAt[pending.from]=os.clock()+retry
+        state.railPending=nil
+        if state.railShots then state.railShots["pending"]=nil end
+    end
+end
+function Strategy.try_railgun()
+    if not options.railguns or state.railFireDenied or not state.ready or state.phase~="playing"
+        or state.engineFault or state.awaitingInit or (state.protocolBlocks and next(state.protocolBlocks))
+        or not fresh() or not state.structuresReady or not Strategy.order_ready("railgun") then return false end
+    local me=state.players[state.id]
+    if not me or not me.alive then return false end
+    if not options.attack and not (options.defend and #state.incoming>0) then return false end
+    local now=os.clock()
+    state.railShots=state.railShots or {};state.railReadyAt=state.railReadyAt or {}
+    for key,shot in pairs(state.railShots) do if shot.untilTime<=now then state.railShots[key]=nil end end
+    if state.railPending then
+        if now-state.railPending.at<5 then return false end
+        state.railPending=nil
+    end
+    local gun=nil
+    for _,s in pairs(state.structures) do
+        if s.kind==21 and s.ownerId==state.id and not s.uc and buffer.readu8(state.owners,s.tile)==state.id
+            and (state.railReadyAt[s.tile] or 0)<=now and (not gun or s.tile<gun.tile) then gun=s end
+    end
+    if not gun then state.railReason="Geen eigen voltooide, herladen railgun";return false end
+    local target=Strategy.rail_target()
+    if not target then state.railReason="Geen geschikt vijandelijk gebouwdoel";return false end
+    if not send({t="railgun",from=gun.tile,tile=target.tile},"RAILGUN: "..target.hits.." vijandelijke gebouwen bij tegel "..target.tile) then return false end
+    state.railPending={from=gun.tile,tile=target.tile,at=now}
+    state.railReadyAt[gun.tile]=now+(gun.rt or Config.RAILGUN_COOLDOWN or 250)/(Config.TICK_RATE or 10)
+    state.railShots["pending"]={tile=target.tile,untilTime=now+Strategy.distance(gun.tile,target.tile)/(Config.RAILGUN_SPEED or 40)/(Config.TICK_RATE or 10)+1}
+    state.railReason="Schot verstuurd; wachten op bevestiging en herladen"
+    Recorder.emit("railgun_order",{from=gun.tile,target=target})
+    return true
+end
+function Strategy.try_build_railgun()
+    if not options.railguns or not options.buildRailguns or state.railBuildDenied or not options.attack
+        or not state.ready or state.phase~="playing" or state.engineFault or state.awaitingInit
+        or not state.structuresReady or not state.gold or not fresh() or #state.incoming>0
+        or os.clock()-(state.lastBuild or -10000)<options.buildDelay
+        or os.clock()<(state.railBuildPendingUntil or 0) then return false end
+    local me=state.players[state.id]
+    if not me or not me.alive then return false end
+    local count=0
+    for _,s in pairs(state.structures) do
+        if s.kind==21 and s.ownerId==state.id and buffer.readu8(state.owners,s.tile)==state.id then count+=1 end
+    end
+    local cost=state.railgunCost
+    if count>=options.maxRailguns or not cost or cost<=0 or Strategy.city_value(state.id)<3
+        or state.gold-cost<math.max(options.goldReserve,Strategy.shield_savings()) then return false end
+    if not Strategy.rail_target() then return false end
+    local tile=Strategy.build_spot(21)
+    if not tile then return false end
+    if send({t="build",tile=tile,kind=21},"RAILGUN: veilig achter de grens bouwen") then
+        state.lastBuild=os.clock();state.lastSend=os.clock();state.blockedBuild[tile]=os.clock()+30
+        state.railBuildPendingUntil=os.clock()+math.max(5,(Config.RAILGUN_BUILD_TICKS or 150)/(Config.TICK_RATE or 10)+2)
+        return true
+    end
+    return false
 end
 function Strategy.try_nuke()
     if not options.nukes then state.nukeReason="UIT: schakel Strategische atoomnukes in";return false end
@@ -2582,6 +2744,7 @@ function Strategy.city_affordable(cost,free,count,defensive)
 end
 function Strategy.try_build(defensive)
     if not state.structuresReady or not state.gold or os.clock()-(state.lastBuild or -10000)<options.buildDelay then return false end
+    if not defensive and Strategy.try_build_railgun() then return true end
     local contacts=Strategy.contacts()
     local me=state.players[state.id]
     local highThreat=defensive
@@ -3669,7 +3832,7 @@ function Strategy.capture_round_memory(payload)
     local memory={}
     for _,key in ipairs({"playingAt","lastCaptureAt","lastBreakoutAt","breakout","frontProgress","boosts",
         "territoryGrowth","catchupLeader","catchupActive","orderSerial","lastNuke","lastNukeScan","nukeSalvoCount",
-        "nukeFastBlockedUntil","nukePending","nukeBudgetAfter","defenseCounterAt","riverOrders","waterFailures","waterOwnerRetry","waterStalledAt","lastFallbackTransport","lastHostileMissile","defenseRecovery","defenseSpending","cautionUntil","lastCapRecovery","hostileWarheads","defenseBurst","lastBorderGuard","counterWindows"}) do memory[key]=state[key] end
+        "nukeFastBlockedUntil","nukePending","nukeBudgetAfter","railReadyAt","railPending","railShots","railFireDenied","railBuildDenied","railBuildPendingUntil","defenseCounterAt","riverOrders","waterFailures","waterOwnerRetry","waterStalledAt","lastFallbackTransport","lastHostileMissile","defenseRecovery","defenseSpending","cautionUntil","lastCapRecovery","hostileWarheads","defenseBurst","lastBorderGuard","counterWindows"}) do memory[key]=state[key] end
     return memory
 end
 function Strategy.restore_round_memory(memory)
@@ -3722,6 +3885,8 @@ local function state_event(kind,payload,extra)
         local generation=state.generation
         state.round=payload.round; state.id=payload.yourId; state.phase=payload.phase
         state.structureRevision=0;state.postCache=nil;state.targetCache=nil;state.contactCache=nil
+        state.railReadyAt={};state.railShots={};state.railPending=nil;state.railFireDenied=false;state.railBuildDenied=false
+        state.railBuildPendingUntil=0;state.railgunCost=nil;state.railReason=nil
         state.lastWireAt=-10000;state.capIdleSince=nil;state.capIdleTotal=0;state.plannerStats=nil
         state.lastStatusAt=-10000;state.landRouteCache=nil
         state.mode=payload.modeId; state.historical=payload.historical; state.mapId=payload.mapId or "us"
@@ -3823,6 +3988,7 @@ local function state_event(kind,payload,extra)
             state.reinforceReadyAt=os.clock()+payload.reinforceLeft/(Config.TICK_RATE or 10)
         end
         state.postCost=payload.postCost or state.postCost
+        state.railgunCost=payload.railgunCost or state.railgunCost
         state.samCost=payload.samCost or state.samCost;state.freeSams=payload.freeSams or 0
         state.freeCities=payload.freeCities or 0;state.freePosts=payload.freePosts or 0;state.freeNukes=payload.freeNukes or 0
         state.allies={}
@@ -3841,6 +4007,7 @@ local function state_event(kind,payload,extra)
         if extra then state.structures={} end
         state.structures=state.structures or {}
         for _,s in ipairs(payload) do
+            Strategy.rail_structure(s)
             if s.ownerId==0 or (s.level or 0)<=0 then state.structures[s.tile]=nil
             else local copy=table.clone(s);copy.kind=copy.kind or 1;state.structures[s.tile]=copy end
         end
@@ -3849,6 +4016,7 @@ local function state_event(kind,payload,extra)
         state.structureRevision=(state.structureRevision or 0)+1
     elseif kind=="built" then
         state.errorCount=0;state.gold=payload.gold or state.gold
+        if payload.kind==21 then state.railgunCost=payload.cost or state.railgunCost end
         if payload.kind==1 then state.cityCost=payload.cost or state.cityCost
         elseif payload.kind==3 then state.postCost=payload.cost or state.postCost
         elseif payload.kind==5 then state.samCost=payload.cost or state.samCost end
@@ -3869,6 +4037,7 @@ local function state_event(kind,payload,extra)
         state.spawnTile=payload.tile or state.pendingSpawn;state.pendingSpawn=nil;state.errorCount=0
         log(state.previewChosen and "Voorlopige spawn bevestigd; omgeving blijft gecontroleerd." or "Spawn bevestigd.")
     elseif kind=="denied" then
+        Strategy.rail_denied(payload)
         log("Server weigert: "..tostring(payload.reason))
         if state.phase=="spawn" and state.pendingSpawn then
             state.rejectedSpawn[state.pendingSpawn]=true
@@ -3902,7 +4071,7 @@ local function state_event(kind,payload,extra)
         if payload.reason=="toomanytransportboats" then state.transportRetryAt=os.clock()+30 end
         if command and command.t=="build" and state.blockedBuild then state.blockedBuild[command.tile]=os.clock()+45 end
         local expected={own=true,pass=true,gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true,
-            busy=true,nobeach=true,nocoast=true,nosearoute=true,toomanytransportboats=true,toomanyfronts=true}
+            busy=true,notready=true,notyours=true,nobeach=true,nocoast=true,nosearoute=true,toomanytransportboats=true,toomanyfronts=true}
         if not expected[payload.reason] then state.errorCount=state.errorCount+1 end
         if payload.reason=="toomanyfronts" then
             state.frontLimitDenied={active=#state.outgoing,retryAt=os.clock()+10}
@@ -4311,7 +4480,7 @@ function Recorder.sample()
   width=W,height=H,mapRevision=state.mapRevision,ready=state.ready,
   gold=state.gold,capacity=me and Strategy.capacity(me),measuredGrowth=state.measuredGrowth,
   planner=state.plannerStats,capSeconds=(state.capIdleTotal or 0)+(state.capIdleSince and os.clock()-state.capIdleSince or 0),
-  legalRatios=Config.attackPresets(state.mode),
+  legalRatios=Config.attackPresets(state.mode),railgun={reason=state.railReason,readyAt=state.railReadyAt,pending=state.railPending,shots=state.railShots,cost=state.railgunCost,fireDenied=state.railFireDenied,buildDenied=state.railBuildDenied},
   ownLossRate=state.homeLossRate,allies=state.allies,teams=state.teams,
   incoming=state.incoming,outgoing=state.outgoing,
   costs={city=state.cityCost,defense=state.postCost,sam=state.samCost,reinforce=state.reinforceCost},
@@ -4448,7 +4617,7 @@ local function run_step()
     local before=state.orderSerial or 0
     local ok,result=xpcall(function()
         Strategy.repair_map_if_needed()
-        if not Strategy.emergency_defense_step() and not Strategy.fast_counter_step() then run_step_inner() end
+        if not Strategy.emergency_defense_step() and not Strategy.fast_counter_step() and not Strategy.try_railgun() then run_step_inner() end
         if state.phase=="playing" and not state.awaitingInit and not state.engineFault then Strategy.target_diagnostics() end
         if (state.orderSerial or 0)==before and Strategy.interleave_ready("build") then
             if #state.incoming>0 then Strategy.try_build(true)
