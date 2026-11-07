@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.3-river-recovery"
+local VERSION="6.4-city-economy"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- protect=true,cities=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
+ protect=true,cities=true,cityBursts=true,smartCityUpgrades=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -241,6 +241,61 @@ Recorder.emit("session",{version=VERSION,placeId=game.PlaceId,gameId=game.GameId
  limits={memoryBytes=Recorder.maxBytes,partBytes=Recorder.maxPartBytes,parts=Recorder.maxParts,playerSampleSeconds=2},
  scope="Client-visible data only. Buffers summarized; normalized player/front/structure records stored separately. No inferred enemy gold or hidden orders."})
 
+local UI={
+ tween=game:GetService("TweenService"),
+ bg=Color3.fromRGB(14,18,28),surface=Color3.fromRGB(23,30,44),
+ hover=Color3.fromRGB(32,43,61),border=Color3.fromRGB(46,59,79),
+ text=Color3.fromRGB(232,239,250),muted=Color3.fromRGB(155,173,196),
+ accent=Color3.fromRGB(96,165,250),selected=Color3.fromRGB(30,57,91),
+ enabled=Color3.fromRGB(26,63,57),green=Color3.fromRGB(74,222,157),
+ danger=Color3.fromRGB(102,36,52),red=Color3.fromRGB(255,151,165),
+}
+function UI.corner(object,radius)
+ local corner=Instance.new("UICorner")
+ corner.CornerRadius=UDim.new(0,radius or 10)
+ corner.Parent=object
+end
+function UI.stroke(object,color)
+ local stroke=Instance.new("UIStroke")
+ stroke.Color=color or UI.border
+ stroke.Thickness=1
+ stroke.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
+ stroke.Parent=object
+ return stroke
+end
+function UI.padding(object,left,right,top,bottom)
+ local padding=Instance.new("UIPadding")
+ padding.PaddingLeft=UDim.new(0,left or 12)
+ padding.PaddingRight=UDim.new(0,right or 12)
+ padding.PaddingTop=UDim.new(0,top or 0)
+ padding.PaddingBottom=UDim.new(0,bottom or 0)
+ padding.Parent=object
+end
+function UI.animate(object,props)
+ UI.tween:Create(object,TweenInfo.new(0.14,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),props):Play()
+end
+function UI.button(object)
+ object.AutoButtonColor=false
+ object.BorderSizePixel=0
+ object.Font=Enum.Font.GothamMedium
+ object.TextSize=14
+ object.TextColor3=UI.text
+ object.BackgroundColor3=UI.surface
+ object:SetAttribute("RestColor",UI.surface)
+ UI.corner(object,9)
+ UI.stroke(object)
+ UI.padding(object,12,12)
+ table.insert(connections,object.MouseEnter:Connect(function()
+  UI.animate(object,{BackgroundColor3=UI.hover})
+ end))
+ table.insert(connections,object.MouseLeave:Connect(function()
+  UI.animate(object,{BackgroundColor3=object:GetAttribute("RestColor") or UI.surface})
+ end))
+end
+function UI.button_color(object,color,textColor)
+ object:SetAttribute("RestColor",color)
+ UI.animate(object,{BackgroundColor3=color,TextColor3=textColor or UI.text})
+end
 local history,toggles,tabs={},{},{}
 local status,logbox,startup
 local ui_loaded=false
@@ -250,15 +305,40 @@ gui.ResetOnSpawn=false
 gui.DisplayOrder=100000
 gui.Parent=pg
 local panel=Instance.new("Frame")
-panel.Size=UDim2.new(0,460,0,300)
-panel.Position=UDim2.new(0.5,-230,0.5,-150)
-panel.BackgroundColor3=Color3.fromRGB(20,25,35)
+panel.Size=UDim2.new(0,640,0,500)
+panel.AnchorPoint=Vector2.new(0.5,0.5)
+panel.Position=UDim2.fromScale(0.5,0.5)
+panel.BackgroundColor3=UI.bg
 panel.BorderSizePixel=0
 panel.Parent=gui
+UI.corner(panel,14)
+UI.stroke(panel)
+UI.scale=Instance.new("UIScale")
+UI.scale.Parent=panel
+function UI.fit()
+ local camera=workspace.CurrentCamera
+ if not camera then return end
+ local viewport=camera.ViewportSize
+ UI.scale.Scale=math.min(1,math.max(1,viewport.X-24)/640,math.max(1,viewport.Y-72)/500)
+end
+function UI.watch_camera()
+ if UI.cameraConnection then UI.cameraConnection:Disconnect() end
+ local camera=workspace.CurrentCamera
+ if camera then
+  UI.cameraConnection=camera:GetPropertyChangedSignal("ViewportSize"):Connect(UI.fit)
+  table.insert(connections,UI.cameraConnection)
+ end
+ UI.fit()
+end
+UI.watch_camera()
+table.insert(connections,workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(UI.watch_camera))
 local title=Instance.new("TextLabel")
-title.Size=UDim2.new(1,-100,0,38)
+title.Size=UDim2.new(1,-116,0,54)
+title.Position=UDim2.fromOffset(18,0)
+title.Font=Enum.Font.GothamBold
+title.TextXAlignment=Enum.TextXAlignment.Left
 title.BackgroundTransparency=1
-title.TextColor3=Color3.new(1,1,1)
+title.TextColor3=UI.text
 title.TextSize=17
 title.Text="FRONT PANEL "..VERSION
 title.Parent=panel
@@ -272,10 +352,12 @@ local function simple_button(text,x,y,w,h,parent)
  b.TextWrapped=true
  b.Text=text
  b.Parent=parent
+ UI.button(b)
  return b
 end
-local minimize=simple_button("-",366,2,42,34,panel)
-local close=simple_button("X",412,2,42,34,panel)
+local minimize=simple_button("−",542,10,38,34,panel)
+local close=simple_button("×",588,10,38,34,panel)
+UI.button_color(close,UI.danger,UI.red)
 local collapsed=false
 local expanded=panel.Size
 local function cleanup()
@@ -290,7 +372,7 @@ end
 close.Activated:Connect(function() cleanup(); gui:Destroy() end)
 minimize.Activated:Connect(function()
  collapsed=not collapsed
- panel.Size=collapsed and UDim2.new(0,460,0,38) or expanded
+ panel.Size=collapsed and UDim2.new(0,640,0,54) or expanded
  for _,tab in pairs(tabs) do tab.page.Visible=not collapsed and tab.selected end
  for _,child in ipairs(panel:GetChildren()) do
   if child~=title and child~=minimize and child~=close then
@@ -299,16 +381,18 @@ minimize.Activated:Connect(function()
    end
   end
  end
- minimize.Text=collapsed and "+" or "-"
+ minimize.Text=collapsed and "+" or "−"
 end)
 startup=Instance.new("TextLabel")
-startup.Size=UDim2.new(1,-20,1,-50)
-startup.Position=UDim2.new(0,10,0,42)
+startup.Size=UDim2.new(1,-32,1,-72)
+startup.Position=UDim2.new(0,16,0,60)
+startup.Font=Enum.Font.GothamMedium
 startup.Text="UI laden... Als dit blijft staan, is het bestand mogelijk onvolledig geplakt."
 startup.TextColor3=Color3.new(1,1,1)
 startup.TextWrapped=true
 startup.TextSize=16
-startup.BackgroundColor3=Color3.fromRGB(20,25,35)
+startup.BackgroundColor3=UI.bg
+UI.corner(startup,10)
 startup.ZIndex=20
 startup.Parent=panel
 local function log(message)
@@ -321,8 +405,14 @@ local function log(message)
 end
 local function refresh_toggles()
  for key,item in pairs(toggles) do
-  item.button.Text=item.name..": "..(options[key] and "AAN" or "UIT")
-  item.button.BackgroundColor3=options[key] and Color3.fromRGB(30,125,80) or Color3.fromRGB(35,80,145)
+  item.button.Text=""
+  if item.caption then item.caption.Text=item.name end
+  UI.button_color(item.button,options[key] and UI.enabled or UI.surface)
+  item.button:SetAttribute("Enabled",options[key])
+  if item.switch then
+   UI.animate(item.switch,{BackgroundColor3=options[key] and UI.green or UI.border})
+   UI.animate(item.knob,{Position=UDim2.fromOffset(options[key] and 23 or 3,3)})
+  end
  end
  title.Text="FRONT PANEL "..VERSION.." | "..(options.dry and "OBSERVATIE" or "ACTIEF")
 end
@@ -330,6 +420,7 @@ local function halt(reason)
  for _,key in ipairs({"queue","spawn","expand","attack","defend","leave","cities","posts","nukes","sams","reinforce","buyReinforcements"}) do options[key]=false end
  refresh_toggles()
  save_settings()
+ state.cityBurst=nil
  state.reason=reason or "Gestopt"
  if reason then
   log(reason)
@@ -355,6 +446,10 @@ local function select_tab(name)
  for key,tab in pairs(tabs) do
   tab.selected=key==name
   tab.page.Visible=tab.selected and not collapsed
+  if tab.button then
+   UI.button_color(tab.button,tab.selected and UI.selected or UI.surface,tab.selected and UI.accent or UI.muted)
+   tab.indicator.Visible=tab.selected
+  end
  end
 end
 local function row(tab,class,props)
@@ -363,6 +458,26 @@ local function row(tab,class,props)
  for k,v in pairs(props) do object[k]=v end
  object.Position=UDim2.new(0,0,0,t.y)
  object.Parent=t.page
+ object.BorderSizePixel=0
+ object.Font=Enum.Font.Gotham
+ if object:IsA("TextButton") then
+  UI.button(object)
+ elseif object:IsA("TextBox") then
+  object.BackgroundColor3=UI.surface
+  object.TextColor3=UI.text
+  object.TextXAlignment=Enum.TextXAlignment.Left
+  object.TextYAlignment=object.MultiLine and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center
+  object.Font=object.MultiLine and Enum.Font.Code or Enum.Font.GothamMedium
+  UI.corner(object,9)
+  local outline=UI.stroke(object)
+  UI.padding(object,12,12,object.MultiLine and 10 or 0,object.MultiLine and 10 or 0)
+  table.insert(connections,object.Focused:Connect(function() UI.animate(outline,{Color=UI.accent}) end))
+  table.insert(connections,object.FocusLost:Connect(function() UI.animate(outline,{Color=UI.border}) end))
+ else
+  object.TextColor3=UI.muted
+  object.TextSize=13
+  object.LineHeight=1.15
+ end
  t.y=t.y+object.Size.Y.Offset+8
  t.page.CanvasSize=UDim2.new(0,0,0,t.y)
  return object
@@ -373,8 +488,8 @@ local function label(tab,text,height)
   TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top})
 end
 local function button(tab,text,callback)
- local b=row(tab,"TextButton",{Size=UDim2.new(1,-10,0,38),Text=text,
-  BackgroundColor3=Color3.fromRGB(35,80,145),TextColor3=Color3.new(1,1,1),TextSize=15,TextWrapped=true})
+ local b=row(tab,"TextButton",{Size=UDim2.new(1,-10,0,44),Text=text,
+  BackgroundColor3=UI.surface,TextColor3=UI.text,TextSize=14,TextWrapped=true})
  b.Activated:Connect(guard(callback))
  return b
 end
@@ -384,6 +499,34 @@ local function toggle(tab,name,key)
   log(name..": "..tostring(options[key]))
   if key=="dry" then log(options.dry and "Observatie: geen spelorders." or "Actieve modus: ingeschakelde functies versturen orders.") end
  end)}
+ local item=toggles[key]
+ item.button.TextXAlignment=Enum.TextXAlignment.Left
+ item.button.Text=""
+ item.caption=Instance.new("TextLabel")
+ item.caption.Size=UDim2.new(1,-66,1,0)
+ item.caption.BackgroundTransparency=1
+ item.caption.Font=Enum.Font.GothamMedium
+ item.caption.TextSize=14
+ item.caption.TextColor3=UI.text
+ item.caption.TextWrapped=true
+ item.caption.TextXAlignment=Enum.TextXAlignment.Left
+ item.caption.Text=name
+ item.caption.Parent=item.button
+ item.switch=Instance.new("Frame")
+ item.switch.Name="ToggleTrack"
+ item.switch.Size=UDim2.fromOffset(44,24)
+ item.switch.Position=UDim2.new(1,-54,0.5,-12)
+ item.switch.BorderSizePixel=0
+ item.switch.Parent=item.button
+ UI.corner(item.switch,12)
+ item.knob=Instance.new("Frame")
+ item.knob.Name="ToggleKnob"
+ item.knob.Size=UDim2.fromOffset(18,18)
+ item.knob.Position=UDim2.fromOffset(3,3)
+ item.knob.BackgroundColor3=UI.text
+ item.knob.BorderSizePixel=0
+ item.knob.Parent=item.switch
+ UI.corner(item.knob,9)
 end
 local function number_input(tab,name,key,lo,hi)
  label(tab,name,25)
@@ -399,19 +542,40 @@ local ui_ok,ui_error=xpcall(function()
  panel.ClipsDescendants=true
  for i,name in ipairs({"Overzicht","Match","Oorlog","Instellen","Foutlog","Data"}) do
   local page=Instance.new("ScrollingFrame")
-  page.Position=UDim2.new(0,112,0,44)
-  page.Size=UDim2.new(1,-120,1,-90)
+  page.Position=UDim2.new(0,162,0,66)
+  page.Size=UDim2.new(1,-176,1,-130)
   page.CanvasSize=UDim2.new(0,0,0,0)
   page.BackgroundTransparency=1
   page.BorderSizePixel=0
-  page.ScrollBarThickness=4
+  page.ScrollBarThickness=3
+  page.ScrollBarImageColor3=UI.accent
+  page.VerticalScrollBarInset=Enum.ScrollBarInset.ScrollBar
+  page.ScrollingDirection=Enum.ScrollingDirection.Y
   page.Visible=false
   page.Parent=panel
   tabs[name]={page=page,y=0,selected=false}
   local name_copy=name
-  simple_button(name,5,44+(i-1)*34,100,30,panel).Activated:Connect(function() select_tab(name_copy) end)
+  local nav=simple_button(name,14,66+(i-1)*46,132,38,panel)
+  nav.TextXAlignment=Enum.TextXAlignment.Left
+  tabs[name].button=nav
+  local indicator=Instance.new("Frame")
+  indicator.Size=UDim2.fromOffset(3,18)
+  indicator.Position=UDim2.new(0,-8,0.5,-9)
+  indicator.BackgroundColor3=UI.accent
+  indicator.BorderSizePixel=0
+  indicator.Parent=nav
+  UI.corner(indicator,2)
+  tabs[name].indicator=indicator
+  nav.Activated:Connect(function() select_tab(name_copy) end)
  end
  status=label("Overzicht","Spelverbinding wordt geladen...",400)
+ status.BackgroundTransparency=0
+ status.BackgroundColor3=UI.surface
+ status.TextColor3=UI.text
+ status.Font=Enum.Font.Code
+ UI.corner(status,10)
+ UI.stroke(status)
+ UI.padding(status,14,14,12,12)
  label("Overzicht","Zet de gewenste functies aan. ACTIEF voert orders uit. OBSERVATIE toont alleen plannen. Instellingen worden automatisch opgeslagen wanneer je executor dit ondersteunt.",100)
  toggle("Match","Auto join","queue"); toggle("Match","Auto spawn","spawn"); toggle("Match","Verlaat na einde","leave")
  toggle("Match","Herladen na teleport","reload")
@@ -442,6 +606,9 @@ local ui_ok,ui_error=xpcall(function()
  number_input("Instellen","Sterkteverhouding","strength",1.2,10)
  number_input("Instellen","Actievertraging in seconden","interval",2,30)
  toggle("Instellen","Veilige steden upgraden","upgradeCities")
+ toggle("Instellen","Goedkope steden in bouwreeks plaatsen","cityBursts")
+ toggle("Instellen","Goedkope stadsupgrades voorrang geven","smartCityUpgrades")
+ label("Instellen","Bouwreeksen plaatsen maximaal drie steden met serverbevestiging per order. Bij prijswijziging, dreiging of ontbrekende bevestiging stopt de reeks. Goudreserve en stedenlimiet blijven gelden. Reinforcement houdt zijn serverwachttijd.",110)
  number_input("Instellen","Goud achterhouden","goldReserve",0,10000000)
  number_input("Instellen","Maximaal aantal steden","maxCities",1,40)
  number_input("Instellen","Maximaal stadsniveau","maxCityLevel",1,10)
@@ -487,8 +654,8 @@ local ui_ok,ui_error=xpcall(function()
   TextColor3=Color3.new(1,1,1),BackgroundColor3=Color3.fromRGB(30,35,45),TextWrapped=true,
   TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
   MultiLine=true,ClearTextOnFocus=false,TextEditable=false})
- local stop=simple_button("NOODSTOP",5,258,450,36,panel)
- stop.BackgroundColor3=Color3.fromRGB(160,45,65)
+ local stop=simple_button("NOODSTOP · Automatische acties stoppen",14,446,612,40,panel)
+ UI.button_color(stop,UI.danger,UI.red)
  stop.Activated:Connect(function() halt("Noodstop: geen nieuwe automatische orders.") end)
  select_tab("Overzicht")
  refresh_toggles()
@@ -566,7 +733,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.3")
+]=],snapshot,RAW_URL.."?v=6.4")
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1431,7 +1598,7 @@ function Strategy.open_tile()
     end
     return best
 end
-function Strategy.build_spot(kind)
+function Strategy.build_spot(kind,reserved)
     local best,bestScore=nil,-math.huge
     local spacing=(Config.STRUCTURE_MIN_DIST or 15)+2
     local contacts=kind==3 and Strategy.contacts() or {}
@@ -1457,6 +1624,11 @@ function Strategy.build_spot(kind)
                 local d=Strategy.distance(tile,s.tile)
                 closest=math.min(closest,d)
                 if s.ownerId==state.id and buffer.readu8(state.owners,s.tile)==state.id and s.kind==kind then same=math.min(same,d) end
+            end
+            for _,planned in ipairs(reserved or {}) do
+                local d=Strategy.distance(tile,planned)
+                closest=math.min(closest,d)
+                if kind==1 then same=math.min(same,d) end
             end
             if closest>=spacing then
                 local danger=Strategy.nearby_danger(tile)
@@ -1673,6 +1845,10 @@ function Strategy.interleave_ready(kind)
     return false
 end
 function Strategy.order_ready(kind)
+    local burst=state.cityBurst
+    if burst then
+        return kind=="build" and burst.sending==true and os.clock()-state.lastAction>=0.22
+    end
     return os.clock()-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
 end
 local function send(payload,description)
@@ -1758,6 +1934,107 @@ function Strategy.city_affordable(cost,free,count,defensive)
     if count<3 and not defensive then floor=0 end
     return state.gold-cost>=floor
 end
+function Strategy.finish_city_burst(reason)
+    local burst=state.cityBurst
+    if not burst then return end
+    state.cityBurst=nil
+    Recorder.emit("city_burst_end",{reason=reason,confirmed=burst.confirmed,planned=#burst.tiles,cost=burst.cost})
+    log("Bouwreeks: "..tostring(burst.confirmed).."/"..#burst.tiles.." bevestigd; "..reason)
+end
+function Strategy.city_burst_plan(tile,cost,free,count)
+    if not options.cityBursts or options.dry or free or type(cost)~="number" or cost<=0
+        or #state.incoming>0 or not state.gold then return nil end
+    local tiles={tile}
+    local available=state.gold-cost
+    for i=2,math.min(3,options.maxCities-count) do
+        local floor=(count+i-1)<3 and 0 or options.goldReserve
+        if state.catchupActive then floor*=0.50 end
+        if available-cost<floor then break end
+        local nextTile=Strategy.build_spot(1,tiles)
+        if not nextTile then break end
+        tiles[#tiles+1]=nextTile;available-=cost
+    end
+    if #tiles<2 then return nil end
+    local duration=(Config.CITY_BUILD_TICKS or 20)/(Config.TICK_RATE or 10)
+    if duration<=0.5 then return nil end
+    local now=os.clock()
+    return {tiles=tiles,cost=cost,index=2,confirmed=0,pendingTile=tile,
+        expires=now+math.min(1.3,duration*0.65),generation=state.generation,count=count}
+end
+function Strategy.city_burst_ack(payload)
+    local burst=state.cityBurst
+    if not burst then return end
+    if payload.kind~=1 or payload.tile~=burst.pendingTile or payload.reason~="build" then
+        Strategy.finish_city_burst("afwijkende bouwbevestiging");return
+    end
+    burst.confirmed+=1
+    burst.pendingTile=nil
+    if type(payload.cost)~="number" or payload.cost~=burst.cost then
+        Strategy.finish_city_burst("serverprijs gewijzigd");return
+    end
+    if burst.index>#burst.tiles then Strategy.finish_city_burst("reeks voltooid") end
+end
+function Strategy.continue_city_burst()
+    local burst=state.cityBurst
+    if not burst then return false end
+    local me=state.players[state.id]
+    local now=os.clock()
+    if not alive or not options.cities or not options.cityBursts or options.dry
+        or burst.generation~=state.generation or state.phase~="playing" or not state.ready
+        or state.engineFault or state.awaitingInit or (state.protocolBlocks and next(state.protocolBlocks))
+        or not fresh() or not me or not me.alive or #state.incoming>0 then
+        Strategy.finish_city_burst("spelstatus of dreiging gewijzigd");return false
+    end
+    if now>=burst.expires then
+        Strategy.finish_city_burst(burst.pendingTile and "bevestiging te laat; geen herhaling" or "bouwvenster verstreken")
+        return false
+    end
+    if burst.pendingTile then state.reason="Bouwreeks: wachten op serverbevestiging";return true end
+    if now-state.lastAction<0.22 then return true end
+    if state.cityCost~=burst.cost or type(state.gold)~="number" then
+        Strategy.finish_city_burst("geen actuele gelijkblijvende prijs");return false
+    end
+    local count=0
+    for _,city in pairs(state.structures) do
+        if city.ownerId==state.id and city.kind==1 and buffer.readu8(state.owners,city.tile)==state.id then count+=1 end
+    end
+    count=math.max(count,burst.count+burst.confirmed)
+    if count>=options.maxCities or not Strategy.city_affordable(burst.cost,false,count,false) then
+        Strategy.finish_city_burst("stedenlimiet of goudreserve");return false
+    end
+    local tile=burst.tiles[burst.index]
+    if not tile or buffer.readu8(state.owners,tile)~=state.id or not passable(tile)
+        or (state.blockedBuild[tile] or 0)>now or Strategy.nearby_danger(tile)>=1 then
+        Strategy.finish_city_burst("bouwplek niet meer veilig of beschikbaar");return false
+    end
+    local spacing=(Config.STRUCTURE_MIN_DIST or 15)+2
+    for _,structure in pairs(state.structures) do
+        if Strategy.distance(tile,structure.tile)<spacing then
+            Strategy.finish_city_burst("bouwplek inmiddels bezet");return false
+        end
+    end
+    burst.sending=true
+    local sent=send({t="build",tile=tile,kind=1},"BOUWREEKS: stad "..burst.index.."/"..#burst.tiles.."; serverprijs "..burst.cost)
+    burst.sending=false
+    if sent then
+        burst.pendingTile=tile;burst.index+=1
+        state.lastBuild=now;state.lastSend=now;state.blockedBuild[tile]=now+30
+        Recorder.emit("city_burst_order",{tile=tile,index=burst.index-1,cost=burst.cost})
+    end
+    return true
+end
+function Strategy.city_upgrade(cities)
+    if not options.upgradeCities then return nil end
+    local best,lowest=nil,math.huge
+    for _,city in ipairs(cities) do
+        if not city.uc and city.level<math.min(options.maxCityLevel,Config.STRUCTURE_MAX_LEVEL or 10)
+            and city.level<lowest and Strategy.nearby_danger(city.tile)<1
+            and (state.blockedBuild[city.tile] or 0)<os.clock() then
+            best=city.tile;lowest=city.level
+        end
+    end
+    return best
+end
 function Strategy.try_build(defensive)
     if not state.structuresReady or not state.gold or os.clock()-(state.lastBuild or -10000)<options.buildDelay then return false end
     local contacts=Strategy.contacts()
@@ -1768,6 +2045,7 @@ function Strategy.try_build(defensive)
         if enemy and enemy.isBot~=true and (c.troops>=me.troops*0.35 or (state.levels or 0)>=3) then highThreat=true end
         if c.troops*Strategy.threat_factor(id)>=me.troops*0.8 then highThreat=true end
     end
+    state.cityBuildPlan=nil;state.cityUpgradePlanned=false
     local kind,tile,cost,free=nil,nil,nil,false
     if options.posts and highThreat then
         local posts=0
@@ -1786,21 +2064,30 @@ function Strategy.try_build(defensive)
         local cities={}
         for _,s in pairs(state.structures) do if s.ownerId==state.id and buffer.readu8(state.owners,s.tile)==state.id and s.kind==1 then table.insert(cities,s) end end
         cost=state.cityCost;free=(state.freeCities or 0)>0;kind=1
-        if #cities<options.maxCities and Strategy.city_affordable(cost,free,#cities,defensive) then tile=Strategy.build_spot(1) end
-        if not tile and options.upgradeCities and cost and state.gold-cost>=options.goldReserve then
-            local lowest=math.huge
-            for _,s in ipairs(cities) do
-                if not s.uc and s.level<math.min(options.maxCityLevel,Config.STRUCTURE_MAX_LEVEL or 10)
-                    and s.level<lowest and Strategy.nearby_danger(s.tile)<1
-                    and (state.blockedBuild[s.tile] or 0)<os.clock() then tile=s.tile;lowest=s.level end
-            end
-        end
+        local placement=nil
+        if #cities<options.maxCities and Strategy.city_affordable(cost,free,#cities,defensive) then placement=Strategy.build_spot(1) end
+        local upgrade=nil
+        if type(cost)=="number" and state.gold-cost>=options.goldReserve then upgrade=Strategy.city_upgrade(cities) end
+        local burst=placement and Strategy.city_burst_plan(placement,cost,free,#cities) or nil
+        if options.smartCityUpgrades and upgrade and not free and not burst then
+            tile=upgrade
+        else tile=placement or upgrade end
+        state.cityBuildPlan=tile==placement and burst or nil
+        state.cityUpgradePlanned=tile~=nil and tile==upgrade
     end
     if not tile then return false end
     local description=kind==1 and "stad op veilige, verspreide locatie bouwen/upgraden"
         or kind==5 and "anti-nuketoren voor ongedekte belangrijke steden bouwen"
         or "verdedigingspost bij bedreigde grens bouwen"
+    if kind==1 then
+        description=state.cityUpgradePlanned and ("SLIM UPGRADEN: stadsniveau verhogen voor serverprijs "..tostring(cost))
+            or (state.cityBuildPlan and ("BOUWREEKS: eerste van "..#state.cityBuildPlan.tiles.." steden voor huidige serverprijs "..tostring(cost)) or description)
+    end
     if send({t="build",tile=tile,kind=kind},description) then
+        if kind==1 and state.cityBuildPlan then
+            state.cityBurst=state.cityBuildPlan
+            Recorder.emit("city_burst_start",{tiles=state.cityBurst.tiles,cost=cost,window=state.cityBurst.expires-os.clock()})
+        end
         state.lastBuild=os.clock();state.lastSend=os.clock();state.blockedBuild[tile]=os.clock()+30
         return true
     end
@@ -2327,6 +2614,7 @@ local function state_event(kind,payload,extra)
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
         state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
+        state.cityBurst=nil;state.cityBuildPlan=nil;state.cityUpgradePlanned=false
         state.blockedBuild={};state.plannedBlasts={};state.gold=nil;state.cityCost=nil;state.postCost=nil
         state.freeCities=0;state.freePosts=0;state.freeNukes=0;state.freeSams=0;state.samCost=nil
         state.reinforceCost=nil;state.reinforceTroops=nil;state.reinforceQuoteAt=nil
@@ -2443,6 +2731,10 @@ local function state_event(kind,payload,extra)
         if payload.kind==1 then state.cityCost=payload.cost or state.cityCost
         elseif payload.kind==3 then state.postCost=payload.cost or state.postCost
         elseif payload.kind==5 then state.samCost=payload.cost or state.samCost end
+        Strategy.city_burst_ack(payload)
+        if payload.reason=="upgrade" and payload.kind==1 and options.smartCityUpgrades and state.blockedBuild then
+            state.blockedBuild[payload.tile]=os.clock()+0.25
+        end
         log("Bouw bevestigd op tegel "..tostring(payload.tile))
     elseif kind=="reinforced" then
         state.gold=payload.gold or state.gold
@@ -2460,6 +2752,7 @@ local function state_event(kind,payload,extra)
         state.spawnTile=payload.tile or state.pendingSpawn;state.pendingSpawn=nil;state.errorCount=0
         log(state.previewChosen and "Voorlopige spawn bevestigd; omgeving blijft gecontroleerd." or "Spawn bevestigd.")
     elseif kind=="denied" then
+        Strategy.finish_city_burst("serverweigering: "..tostring(payload.reason))
         log("Server weigert: "..tostring(payload.reason))
         if state.phase=="spawn" and state.pendingSpawn then
             state.rejectedSpawn[state.pendingSpawn]=true
@@ -2999,7 +3292,7 @@ local function run_step()
     state.planContext={}
     local before=state.orderSerial or 0
     local ok,result=xpcall(function()
-        run_step_inner()
+        if not Strategy.continue_city_burst() then run_step_inner() end
         if state.phase=="playing" then Strategy.target_diagnostics() end
         if (state.orderSerial or 0)==before and Strategy.interleave_ready("build") then
             if #state.incoming>0 then Strategy.try_build(true)
@@ -3013,7 +3306,7 @@ local function run_step()
     local telemetryOk,telemetryError=pcall(Recorder.tick)
     if not telemetryOk then Recorder.error="Telemetrie: "..tostring(telemetryError);Recorder.render() end
     state.planContext=nil
-    if not ok then error(result,0) end
+    if not ok then Strategy.finish_city_burst("plannerfout");error(result,0) end
     return result
 end
 
@@ -3092,5 +3385,5 @@ task.spawn(guard(function()
             task.wait(1)
         end
     end)
-    while alive do guard(run_step)(); task.wait(0.5) end
+    while alive do guard(run_step)(); task.wait(state.cityBurst and 0.1 or 0.5) end
 end))
