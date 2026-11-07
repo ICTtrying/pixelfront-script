@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.15-capacity-recovery"
+local VERSION="6.16-repo-strategy"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- capRecovery=true,neighborReserve=true,growthDefense=true,adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
+ combatAware=true,preciseOrders=true,layeredSams=true,attritionAware=true,capRecovery=true,neighborReserve=true,growthDefense=true,adaptiveSams=true,activeDefense=true,protect=true,finishHumans=true,routeAwareTargets=true,adaptiveLandCampaign=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -596,6 +596,10 @@ local ui_ok,ui_error=xpcall(function()
  toggle("Oorlog","Antiraketdekking laten meegroeien","adaptiveSams")
  toggle("Oorlog","Snel inkomende legers opvangen","activeDefense")
  toggle("Oorlog","Groeireserve behouden bij verdedigen","growthDefense")
+ toggle("Oorlog","Gevechtskosten meewegen bij doelkeuze","combatAware")
+ toggle("Oorlog","Passende inzet tussen vaste percentages","preciseOrders")
+ toggle("Oorlog","Extra antiraketlaag bij waargenomen salvo","layeredSams")
+ toggle("Oorlog","Uitputtingsslag vermijden bij verdediging","attritionAware")
  toggle("Oorlog","Botlanden met steden eerst","botCities")
  toggle("Oorlog","Huizen van zwakke landen heel houden","preserveBotCities")
  toggle("Oorlog","Groeicurve benutten","growthAware")
@@ -742,7 +746,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.15",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.16",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1226,6 +1230,50 @@ function Strategy.threat_factor(id)
     local cities=Strategy.city_value(id)
     return cities>0 and 0.45 or 0.20
 end
+function Strategy.attack_choices(needed)
+    local presets=Config.attackPresets(state.mode)
+    if not options.preciseOrders then return presets end
+    local me=state.players[state.id]
+    if not me or me.troops<=0 then return presets end
+    local choices=table.clone(presets)
+    local ratio=math.max(Config.MIN_ATTACK_RATIO or 0.05,math.ceil(needed/me.troops*1000-1e-9)/1000)
+    if math.floor(me.troops*ratio)<math.ceil(needed) then ratio+=0.001 end
+    local limit=math.min(0.75,Config.MAX_ATTACK_RATIO or 1)
+    if ratio<=limit then choices[#choices+1]=ratio end
+    return choices
+end
+function Strategy.combat_estimate(id,tile,committed)
+    local me,enemy=state.players[state.id],state.players[id]
+    if not me or not enemy or not Strategy.attack_tile_valid(tile,id) or committed<=0 then return nil end
+    local altitude=bit32.band(buffer.readu8(state.terrain,tile),63)
+    local terrain=altitude<11 and 1 or altitude<21 and 2 or 3
+    local mag=(Config.TERRAIN_MAG or {80,100,120})[terrain]
+    local speed=(Config.TERRAIN_SPEED or {16.5,20,25})[terrain]
+    local covered=false
+    for _,post in pairs(state.structures or {}) do
+        if post.ownerId==id and post.kind==3 and not post.uc and buffer.readu8(state.owners,post.tile)==id
+            and Strategy.distance(tile,post.tile)<=(Config.DEFENSE_POST_RANGE or 30) then covered=true;break end
+    end
+    if covered then mag*=Config.DEFENSE_POST_DEFENSE_BONUS or 5;speed*=Config.DEFENSE_POST_SPEED_BONUS or 3 end
+    if enemy.isBot==true then mag*=Config.BOT_DEFENDER_LOSS_MULT or 1 end
+    local floor=Config.DEFENSE_DEBUFF_FLOOR or 0.7
+    local exponent=math.clamp(-math.log(2)/math.max(1,Config.DEFENSE_DEBUFF_HALFLIFE or 50000)
+        *((enemy.tiles or 0)-(Config.DEFENSE_DEBUFF_MIDPOINT or 150000)),-60,60)
+    local size=floor+(1-floor)*(1-1/(1+math.exp(exponent)))
+    local threshold=Config.LARGE_ATTACKER_TILES or 100000
+    local lossBonus=(me.tiles or 0)>threshold and (threshold/me.tiles)^(Config.LARGE_ATTACKER_LOSS_EXP or 0.35) or 1
+    local speedThreshold=Config.LARGE_ATTACKER_SPEED_TILES or threshold
+    local speedBonus=(me.tiles or 0)>speedThreshold and (speedThreshold/me.tiles)^(Config.LARGE_ATTACKER_SPEED_EXP or 0.6) or 1
+    local density=enemy.troops/math.max(1,enemy.tiles or 0)
+    local ratio=math.clamp(enemy.troops/committed,Config.ATTACK_RATIO_MIN or 0.6,Config.ATTACK_RATIO_MAX or 2)
+    local blend=Config.ATTACK_LOSS_BLEND or 0.6
+    local loss=mag*(blend*ratio*(Config.ATTACK_MAG_SCALE or 0.8)*size*lossBonus
+        +(1-blend)*(Config.ATTACK_ALT_COEF or 1.3)*density/100)
+    local time=math.clamp(enemy.troops/((Config.SPEED_RATIO_DIV or 5)*committed),
+        Config.SPEED_RATIO_MIN or 0.2,Config.SPEED_RATIO_MAX or 1.5)*speed*size*speedBonus
+    return {lossPerTile=loss,defenderLossPerTile=density,timeIndex=time,
+        initialLandBudget=committed/math.max(1,loss),covered=covered,terrain=terrain}
+end
 function Strategy.opportunity_ratio(id,covered)
     local me,enemy=state.players[state.id],state.players[id]
     if not me or not enemy or not enemy.alive or friendly(id) or me.troops<=0 then return nil end
@@ -1243,7 +1291,7 @@ function Strategy.opportunity_ratio(id,covered)
     local multiplier=covered and 2 or (enemy.isBot==true and 0.9 or 1.4)
     local needed=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*multiplier)
     local best=nil
-    for _,ratio in ipairs(Config.attackPresets(state.mode)) do
+    for _,ratio in ipairs(Strategy.attack_choices(needed)) do
         local committed=math.floor(me.troops*ratio)
         if committed>=needed and me.troops-committed>=required and (not best or ratio<best) then best=ratio end
     end
@@ -1401,6 +1449,10 @@ function Strategy.target_score(id,tile,distance,pressure)
     local cost=1+enemy.troops/math.max(1,me.troops)*8
     local reward=(2000+assets+land)/cost
     if route and route.fragment then reward*=0.15 end
+    if options.combatAware then
+        local estimate=Strategy.combat_estimate(id,tile,math.max(Config.MIN_ATTACK_TROOPS or 250,me.troops*0.1))
+        if estimate then reward/=(1+estimate.lossPerTile/80+estimate.timeIndex/50) end
+    end
     local humanTargets=Strategy.endgame_humans()
     if humanTargets[id] and (not route or not route.fragment) then reward+=1000000 end
     return reward-Strategy.nearby_danger(tile)*50-(distance or 0)*4
@@ -1769,6 +1821,16 @@ function Strategy.active_orders()
     end
     return #state.outgoing+math.max(afloat,pending)
 end
+function Strategy.shield_layers(tile)
+    if not options.layeredSams or not options.adaptiveSams then return 1 end
+    local count=0
+    for _,shot in pairs(state.hostileWarheads or {}) do
+        if os.clock()-shot.at<=20 and Strategy.distance(tile,shot.tile)<=140 then
+            count+=1;if count>=2 then return 2 end
+        end
+    end
+    return 1
+end
 function Strategy.shield_status()
     local cities,sams={},{}
     for _,structure in pairs(state.structures or {}) do
@@ -1777,21 +1839,25 @@ function Strategy.shield_status()
             elseif structure.kind==5 then sams[#sams+1]=structure end
         end
     end
-    local total,covered,planned=0,0,0
+    local total,covered,planned,layered=0,0,0,false
     for _,city in ipairs(cities) do
-        local weight=(city.level or 1)+2;total+=weight
-        local live,building=false,false
+        local layers=Strategy.shield_layers(city.tile);layered=layered or layers>1
+        local weight=(city.level or 1)+2;total+=weight*layers
+        local live,building=0,0
         for _,sam in ipairs(sams) do
             local radius=Nukes and Nukes.samRange and Nukes.samRange(sam.level or 1) or 70
             if Strategy.distance(city.tile,sam.tile)<=radius*0.85 then
-                building=true;if not sam.uc then live=true end
+                building+=1;if not sam.uc then live+=1 end
             end
         end
-        if live then covered+=weight end
-        if building then planned+=weight end
+        covered+=weight*math.min(layers,live)
+        planned+=weight*math.min(layers,building)
     end
     local limit=options.maxSams
-    if options.adaptiveSams then limit=math.min(32,math.max(limit,math.ceil(#cities/4))) end
+    if options.adaptiveSams then
+        limit=math.min(32,math.max(limit,math.ceil(#cities/4)))
+        if layered then limit=math.min(32,limit+math.ceil(#cities/8)) end
+    end
     local result={cities=#cities,sams=#sams,limit=limit,coverage=total>0 and covered/total or 1,
         plannedCoverage=total>0 and planned/total or 1}
     state.shieldStatus=result
@@ -1809,12 +1875,12 @@ function Strategy.sam_spot()
     if #sams>=Strategy.shield_status().limit then return nil end
     local important={}
     for _,city in ipairs(cities) do
-        local covered=false
+        local count=0
         for _,sam in ipairs(sams) do
             local r=Nukes and Nukes.samRange and Nukes.samRange(sam.level or 1) or coverage
-            if Strategy.distance(city.tile,sam.tile)<=r then covered=true;break end
+            if Strategy.distance(city.tile,sam.tile)<=r*0.85 then count+=1 end
         end
-        if not covered then
+        if count<Strategy.shield_layers(city.tile) then
             table.insert(important,city)
             local x,y=city.tile%W,math.floor(city.tile/W)
             for _,offset in ipairs({{20,0},{-20,0},{0,20},{0,-20},{20,20},{-20,20},{20,-20},{-20,-20}}) do
@@ -2296,7 +2362,15 @@ function Strategy.nuke_interval()
 end
 function Strategy.observe_missiles(payload)
     if type(payload)~="table" then return end
+    state.hostileWarheads=state.hostileWarheads or {}
+    for id,shot in pairs(state.hostileWarheads) do if os.clock()-shot.at>20 then state.hostileWarheads[id]=nil end end
     for _,event in ipairs(payload) do
+        if options.layeredSams and type(event)=="table" and event.e=="l" and type(event.owner)=="number"
+            and not friendly(event.owner) and type(event.dst)=="number" and event.dst>=0 and event.dst<N
+            and state.ready and buffer.readu8(state.owners,event.dst)==state.id then
+            local count=0;for _ in pairs(state.hostileWarheads) do count+=1 end
+            if count<128 and event.id then state.hostileWarheads[event.id]={tile=event.dst,at=os.clock()} end
+        end
         if type(event)=="table" and (event.e=="l" or event.e=="b") and type(event.owner)=="number" and event.owner~=0 and not friendly(event.owner) then
             state.lastHostileMissile=os.clock()
         end
@@ -2551,7 +2625,7 @@ function Strategy.neutral_ratio(existing,fallback,fallbackReserve)
     if existing>=desired*0.85 then return nil,hold,desired end
     local needed=desired-existing
     local best,partial=nil,nil
-    for _,ratio in ipairs(Config.attackPresets(state.mode)) do
+    for _,ratio in ipairs(Strategy.attack_choices(needed)) do
         local committed=math.floor(me.troops*ratio)
         if committed>=(Config.MIN_ATTACK_TROOPS or 250) and me.troops-committed>=hold then
             if committed>=needed and (not best or ratio<best) then best=ratio end
@@ -2673,6 +2747,7 @@ function Strategy.defense_ratio(id)
     if complete and recovery and os.clock()-recovery.at<4 and me.troops<cap*0.20
         and me.troops*(1-complete)<me.troops*0.85 then complete=nil end
     if partial and me.troops<cap*0.20 and recovery and os.clock()-recovery.at<5 then partial=nil end
+    if options.attritionAware and partial and target>=me.troops and not collapse then partial=nil end
     local selected=complete or partial
     state.defenseGrowth={capacity=cap,peak=peak,floor=growthFloor,critical=critical,incoming=total,
         currentGrowth=rate,homeLossRate=loss,ratio=selected,
@@ -2904,7 +2979,7 @@ function Strategy.try_land_campaign(targets)
                 local hold=math.max(me.troops*0.50,top*0.65+total*0.10+incoming*1.50)
                 local covered=state.targetProtected and state.targetProtected[id]
                 local need=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*(covered and 0.65 or 0.35))
-                for _,ratio in ipairs(Config.attackPresets(state.mode)) do
+                for _,ratio in ipairs(Strategy.attack_choices(need)) do
                     local committed=math.floor(me.troops*ratio)
                     if ratio<=0.35 and committed>=need and me.troops-committed>=hold then
                         local score=Strategy.target_score(id,tile,0,true)
@@ -3358,7 +3433,7 @@ function Strategy.capture_round_memory(payload)
     local memory={}
     for _,key in ipairs({"playingAt","lastCaptureAt","lastBreakoutAt","breakout","frontProgress","boosts",
         "territoryGrowth","catchupLeader","catchupActive","orderSerial","lastNuke","lastNukeScan","nukeSalvoCount",
-        "nukeFastBlockedUntil","nukePending","nukeBudgetAfter","defenseCounterAt","riverOrders","waterFailures","waterOwnerRetry","waterStalledAt","lastFallbackTransport","lastHostileMissile","defenseRecovery","defenseSpending","cautionUntil","lastCapRecovery"}) do memory[key]=state[key] end
+        "nukeFastBlockedUntil","nukePending","nukeBudgetAfter","defenseCounterAt","riverOrders","waterFailures","waterOwnerRetry","waterStalledAt","lastFallbackTransport","lastHostileMissile","defenseRecovery","defenseSpending","cautionUntil","lastCapRecovery","hostileWarheads"}) do memory[key]=state[key] end
     return memory
 end
 function Strategy.restore_round_memory(memory)
@@ -3422,7 +3497,7 @@ local function state_event(kind,payload,extra)
         state.boxedSince=nil;state.lastBreakoutAt=nil;state.breakout=nil
         state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
         state.quarantinedAttack={};state.attackOrders={};state.mapRepairPending=false;state.containedDefense=false
-        state.humanFinishReason=nil;state.shieldStatus=nil;state.lastHostileMissile=nil;state.defenseOrder=nil;state.defenseGrowth=nil;state.defenseRecovery=nil;state.defenseSpending=nil;state.cautionUntil=nil;state.neighborBudget=nil;state.capRecoveryOrder=nil;state.lastCapRecovery=nil
+        state.humanFinishReason=nil;state.shieldStatus=nil;state.lastHostileMissile=nil;state.defenseOrder=nil;state.defenseGrowth=nil;state.defenseRecovery=nil;state.defenseSpending=nil;state.cautionUntil=nil;state.neighborBudget=nil;state.capRecoveryOrder=nil;state.lastCapRecovery=nil;state.hostileWarheads={}
         state.nukePending=nil;state.nukeBudgetAfter=nil;state.nukeSalvoCount=0;state.nukeFastBlockedUntil=0;state.fastFrontOrder=nil
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
