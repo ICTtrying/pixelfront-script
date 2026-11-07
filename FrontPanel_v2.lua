@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.6-human-endgame"
+local VERSION="6.7-map-recovery"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -735,7 +735,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.6",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.7",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -985,6 +985,61 @@ local function refresh_tile(tile)
     end
     state.coast[tile]=coast or nil
 end
+function Strategy.quarantine_attack_tile(tile,own)
+    if type(tile)~="number" or tile%1~=0 or tile<0 or tile>=N then return end
+    state.quarantinedAttack=state.quarantinedAttack or {}
+    state.blockedAttack=state.blockedAttack or {}
+    state.quarantinedAttack[tile]={at=os.clock(),own=own==true}
+    state.blockedAttack[tile]=math.huge
+    state.frontier[tile]=nil
+    if own and state.owners then
+        buffer.writeu8(state.owners,tile,state.id)
+        refresh_tile(tile);neighbours(tile,refresh_tile)
+        state.cityCache=nil
+    end
+    for id,entry in pairs(state.waterTargets or {}) do if entry.tile==tile then state.waterTargets[id]=nil end end
+    for id,point in pairs(state.representatives or {}) do if point==tile then state.representatives[id]=nil end end
+    state.lastWaterScan=-10000
+    state.mapRevision=(state.mapRevision or 0)+1
+    state.mapRepairPending=true
+    Recorder.emit("attack_tile_quarantined",{tile=tile,own=own==true})
+end
+function Strategy.handle_own_denial(payload)
+    if payload.reason~="own" then return end
+    if type(payload.tile)=="number" then Strategy.quarantine_attack_tile(payload.tile,true);return end
+    local candidates={}
+    for _,order in ipairs(state.attackOrders or {}) do
+        if not order.rejected and os.clock()-order.at<=4 then candidates[#candidates+1]=order end
+    end
+    for _,order in ipairs(candidates) do
+        order.rejected=true
+        Strategy.quarantine_attack_tile(order.tile,#candidates==1)
+    end
+    state.mapRepairPending=true
+    Recorder.emit("target_race",{candidates=#candidates,reason="server reports own; quarantine until new ownership data"})
+end
+function Strategy.repair_map_if_needed()
+    if not state.mapRepairPending or not folder or not state.id or state.awaitingInit
+        or os.clock()-(state.lastMapRepairAt or -10000)<15 then return end
+    state.lastMapRepairAt=os.clock();state.mapRepairPending=false
+    folder.Intent:FireServer({t="hello",tile=0})
+    Recorder.emit("map_repair_requested",{reason="ambiguous ownership or own rejection"})
+    log("Kaart opnieuw aangevraagd; onbetrouwbare aanvalstegels worden overgeslagen.")
+end
+function Strategy.attack_tile_valid(tile,expectedOwner)
+    if type(tile)~="number" or tile%1~=0 or tile<0 or tile>=N or not state.owners or not state.terrain then return false end
+    if state.quarantinedAttack and state.quarantinedAttack[tile] then return false end
+    if (state.blockedAttack and (state.blockedAttack[tile] or 0)>os.clock()) or not passable(tile) then return false end
+    local owner=buffer.readu8(state.owners,tile)
+    if owner==state.id or (expectedOwner~=nil and owner~=expectedOwner) then return false end
+    if owner~=0 then
+        if state.allies[owner] then return false end
+        local me,other=state.players[state.id],state.players[owner]
+        if me and other and me.team~=nil and me.team==other.team then return false end
+        if other and not other.alive then return false end
+    end
+    return true
+end
 local function apply_delta(data)
     if state.awaitingInit then return false end
     local ok,changes=pcall(decode_delta,data)
@@ -996,12 +1051,27 @@ local function apply_delta(data)
         return pause_map(tostring(changes).." | header="..table.concat(prefix," "))
     end
     local touched={}
+    local seen,ambiguous={},{}
+    for i=1,#changes,2 do
+        local tile,owner=changes[i],changes[i+1]
+        if seen[tile]~=nil and seen[tile]~=owner then ambiguous[tile]=true end
+        seen[tile]=owner
+    end
+    for tile in pairs(ambiguous) do Strategy.quarantine_attack_tile(tile,false) end
     local deltaStats=Recorder.deltaStats or {packets=0,changes=0,transfers={}}
     Recorder.deltaStats=deltaStats;deltaStats.packets+=1;deltaStats.changes+=#changes/2
     deltaStats.firstAt=deltaStats.firstAt or os.clock();deltaStats.lastAt=os.clock()
     local changed=false
     for i=1,#changes,2 do
         local tile,owner=changes[i],changes[i+1]
+        if ambiguous[tile] then continue end
+        local quarantined=state.quarantinedAttack and state.quarantinedAttack[tile]
+        if quarantined and quarantined.own and owner~=state.id and os.clock()-quarantined.at<0.35 then continue end
+        if quarantined then
+            state.quarantinedAttack[tile]=nil
+            state.blockedAttack[tile]=nil
+            touched[tile]=true;neighbours(tile,function(other) touched[other]=true end)
+        end
         local previous=buffer.readu8(state.owners,tile)
         buffer.writeu8(state.owners,tile,owner)
         if owner==state.id and previous~=state.id then state.lastCaptureAt=os.clock() end
@@ -1224,6 +1294,11 @@ function Strategy.breakout_plan(targets)
     end
     return best,bestRatio,bestReserve
 end
+function Strategy.is_real_human(id,enemy)
+    if not enemy or enemy.isBot~=false then return false end
+    local userId=state.rosterUsers and state.rosterUsers[id]
+    return userId==nil or (type(userId)=="number" and userId>0)
+end
 function Strategy.endgame_humans()
     local me=state.players[state.id]
     if not options.finishHumans or not options.attack or not me or not me.alive or me.troops<=0 then return {},0 end
@@ -1234,14 +1309,14 @@ function Strategy.endgame_humans()
     end
     local count,total=0,0
     for id,enemy in pairs(state.players) do
-        if id~=state.id and enemy.alive and enemy.isBot==false and not friendly(id) then
+        if id~=state.id and enemy.alive and Strategy.is_real_human(id,enemy) and not friendly(id) then
             count+=1;total+=math.max(0,enemy.troops)
         end
     end
     local targets={}
     if count>=1 and count<=3 and me.troops>=math.max(Config.MIN_ATTACK_TROOPS or 250,total*4) then
         for id,enemy in pairs(state.players) do
-            if id~=state.id and enemy.alive and enemy.isBot==false and not friendly(id)
+            if id~=state.id and enemy.alive and Strategy.is_real_human(id,enemy) and not friendly(id)
                 and me.troops>=math.max(Config.MIN_ATTACK_TROOPS or 250,enemy.troops*8) then
                 targets[id]=true
             end
@@ -1447,7 +1522,7 @@ function Strategy.water_targets()
         if head%1024==0 then
             task.wait()
             if not alive or generation~=state.generation then return {} end
-            if state.phase=="playing" and #state.incoming>0 then
+            if state.phase=="playing" and #state.incoming>0 and not Strategy.contained_attack() then
                 state.waterSearchInfo="Waterzoektocht onderbroken: inkomende aanval"
                 return state.waterTargets or {}
             end
@@ -1562,6 +1637,20 @@ function Strategy.sam_spot()
         end
     end
     return best
+end
+function Strategy.contained_attack()
+    if #state.incoming==0 then return true end
+    local me=state.players[state.id]
+    if not options.defend or not me or not me.alive or me.troops<=0 or not fresh() then return false end
+    local incoming=0
+    for _,front in ipairs(state.incoming) do incoming+=math.max(0,front.troops) end
+    if incoming>me.troops*0.15 or (state.homeLossRate or 0)>math.max(20,(me.tiles or 0)*0.002) then return false end
+    local strongest=0
+    for id,contact in pairs(Strategy.contacts()) do
+        if not friendly(id) then strongest=math.max(strongest,contact.troops*Strategy.threat_factor(id)) end
+    end
+    if strongest*4>me.troops or incoming*6>me.troops then return false end
+    return Strategy.risk_reserve()<me.troops*0.60
 end
 function Strategy.risk_reserve()
     local top,second,count,total,rawTop=0,0,0,0,0
@@ -1881,6 +1970,10 @@ local function send(payload,description)
         state.reason="Wachten op bevestigd nuke-budget voordat opnieuw goud wordt uitgegeven"
         return false
     end
+    if payload.t=="attack" and not Strategy.attack_tile_valid(payload.tile) then
+        Recorder.emit("order_revalidated",{payload=payload,reason="invalid, friendly, captured or quarantined tile"})
+        return false
+    end
     if payload.t=="attack" and state.blockedAttack and (state.blockedAttack[payload.tile] or 0)>os.clock() then return false end
     if payload.t=="attack" and state.owners and type(payload.tile)=="number"
         and payload.tile>=0 and payload.tile<buffer.len(state.owners) and buffer.readu8(state.owners,payload.tile)==state.id then
@@ -1899,7 +1992,15 @@ local function send(payload,description)
     Recorder.emit("order",{payload=payload,description=description,serial=(state.orderSerial or 0)+1})
     folder.Intent:FireServer(payload)
     state.lastCommand=payload;state.orderSerial=(state.orderSerial or 0)+1
-    if payload.t=="attack" then state.lastTroopOrder=os.clock() end
+    if payload.t=="attack" then
+        state.lastTroopOrder=os.clock()
+        state.attackOrders=state.attackOrders or {}
+        for i=#state.attackOrders,1,-1 do
+            if os.clock()-state.attackOrders[i].at>4 then table.remove(state.attackOrders,i) end
+        end
+        state.attackOrders[#state.attackOrders+1]={tile=payload.tile,at=os.clock(),serial=state.orderSerial}
+        if #state.attackOrders>16 then table.remove(state.attackOrders,1) end
+    end
     if payload.t=="attack" and state.owners and state.frontier[payload.tile] then
         state.landOrders=state.landOrders or {}
         state.landOrders[buffer.readu8(state.owners,payload.tile)]={tile=payload.tile,at=os.clock()}
@@ -2220,7 +2321,7 @@ local function enemy_targets()
     state.targetProtected={}
     for tile in pairs(state.frontier) do
         local id=buffer.readu8(state.owners,tile)
-        if id~=state.id and (id==0 or not friendly(id)) and (not state.blockedAttack or (state.blockedAttack[tile] or 0)<=os.clock()) then
+        if Strategy.attack_tile_valid(tile,id) then
             seen[id]=(seen[id] or 0)+1
             if seen[id]<=32 then
                 local covered=false
@@ -2279,7 +2380,7 @@ function Strategy.human_priority_pending(targets)
     return false
 end
 function Strategy.try_finish_humans(targets)
-    if #state.incoming>0 or not fresh() or not state.ready or state.phase~="playing" then return false end
+    if (#state.incoming>0 and not Strategy.contained_attack()) or not fresh() or not state.ready or state.phase~="playing" then return false end
     local humans,count=Strategy.endgame_humans()
     if not next(humans) then return false end
     local grace=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
@@ -2315,7 +2416,7 @@ function Strategy.try_finish_humans(targets)
     return false
 end
 function Strategy.quick_campaign(targets)
- if not options.attack or #state.outgoing==0 or #state.incoming>0 or not fresh() then return false end
+ if not options.attack or #state.outgoing==0 or (#state.incoming>0 and not Strategy.contained_attack()) or not fresh() then return false end
  local me=state.players[state.id]
  if not me or not me.alive or not state.ready then return false end
  if state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
@@ -2368,7 +2469,7 @@ end
 function Strategy.fast_front_step()
     if not options.fastFrontReinforce or not options.reinforce or options.dry or not alive or not state.ready
         or state.phase~="playing" or state.engineFault or state.awaitingInit
-        or (state.protocolBlocks and next(state.protocolBlocks)) or not fresh() or #state.incoming>0
+        or (state.protocolBlocks and next(state.protocolBlocks)) or not fresh() or (#state.incoming>0 and not Strategy.contained_attack())
         or #state.outgoing==0 or os.clock()-state.lastAction<0.5
         or os.clock()-state.lastAction>=Strategy.action_delay()
         or state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
@@ -2661,6 +2762,7 @@ local function state_event(kind,payload,extra)
         state.reinforceCost=nil;state.reinforceTroops=nil;state.reinforceQuoteAt=nil
         state.boxedSince=nil;state.lastBreakoutAt=nil;state.breakout=nil
         state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
+        state.quarantinedAttack={};state.attackOrders={};state.mapRepairPending=false;state.containedDefense=false
         state.humanFinishReason=nil
         state.nukePending=nil;state.nukeBudgetAfter=nil;state.nukeSalvoCount=0;state.nukeFastBlockedUntil=0;state.fastFrontOrder=nil
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
@@ -2822,13 +2924,7 @@ local function state_event(kind,payload,extra)
             if payload.reason=="pass" then state.reinforceDenied=true;log("Reinforcement niet beschikbaar voor dit account.") end
             state.reinforceQuoteAt=nil
         end
-        if payload.reason=="own" and command and command.t=="attack" and command.tile then
-            state.blockedAttack=state.blockedAttack or {}
-            state.blockedAttack[command.tile]=os.clock()+5
-            state.lastWaterScan=-10000
-            if state.blockedLanding then state.blockedLanding[command.tile]=os.clock()+5 end
-            Recorder.emit("target_race",{tile=command.tile,reason="server reports own; await authoritative map"})
-        end
+        if payload.reason=="own" then Strategy.handle_own_denial(payload) end
         if payload.reason=="toomanytransportboats" then state.transportRetryAt=os.clock()+30 end
         if command and command.t=="build" and state.blockedBuild then state.blockedBuild[command.tile]=os.clock()+45 end
         local expected={own=true,pass=true,gold=true,crowded=true,maxlevel=true,immunity=true,toonear=true,taken=true,notadjacent=true,troops=true,full=true,cooldown=true,
@@ -2838,7 +2934,7 @@ local function state_event(kind,payload,extra)
             state.frontLimitDenied={active=#state.outgoing,retryAt=os.clock()+10}
             Recorder.emit("front_limit_denied",state.frontLimitDenied)
         end
-        state.lastAction=os.clock()+5
+        state.lastAction=payload.reason=="own" and (os.clock()-options.interval) or (os.clock()+5)
         if state.errorCount>=4 then
             state.engineFault="Vier onverwachte serverweigeringen; stuur Foutlog. Instellingen behouden."
             log(state.engineFault)
@@ -2872,7 +2968,7 @@ function Strategy.target_diagnostics()
             local why
             if not options.attack and enemy.isBot~=true then why="Aanvallen staat UIT"
             elseif busy[id] then why="Veldleger vecht al tegen dit land"
-            elseif #state.incoming>0 then
+            elseif #state.incoming>0 and not Strategy.contained_attack() then
                 local hold,critical=Strategy.defense_budget()
                 why=critical and "Zware inkomende aanval" or ("Verdedigingsbudget thuis "..math.ceil(hold))
             elseif Strategy.active_orders()>=(state.planFrontLimit or options.maxFronts) then why="Actieve fronten/transporten vullen limiet"
@@ -2979,10 +3075,12 @@ local function run_step_inner()
     if not fresh() then state.reason="Wachten op actuele troepen/fronten";return end
     Strategy.update_catchup()
     local defending=options.defend and #state.incoming>0
-    if not defending and (state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100)) then state.reason="Wachten op server na order";return end
+    state.containedDefense=#state.incoming>0 and Strategy.contained_attack()
+    if (not defending or state.containedDefense) and (state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100)) then state.reason="Wachten op server na order";return end
     Strategy.audit_border()
     local targets=enemy_targets()
-    if #state.incoming>0 then
+    state.containedDefense=#state.incoming>0 and Strategy.contained_attack()
+    if #state.incoming>0 and not state.containedDefense then
         state.reason="VERDEDIGEN: druk en beschikbare thuisreserve beoordelen"
         state.counterReason=nil
         if defending and Strategy.try_buy_reinforcements() then return end
@@ -3014,7 +3112,7 @@ local function run_step_inner()
     if Strategy.quick_campaign(targets) then return end
     local mapGeneration=state.generation
     Strategy.water_targets()
-    if mapGeneration~=state.generation or not state.ready or not fresh() or #state.incoming>0 then return end
+    if mapGeneration~=state.generation or not state.ready or not fresh() or (#state.incoming>0 and not Strategy.contained_attack()) then return end
     if Strategy.try_buy_reinforcements() then return end
     if Strategy.try_shield() then return end
     local ratio=choose_ratio(false)
@@ -3267,7 +3365,7 @@ function Recorder.decisions()
   pendingBlasts=state.plannedBlasts,lastBuild=state.lastBuild,lastNuke=state.lastNuke,
   lastAction=state.lastAction,actionDelay=Config and Strategy.action_delay(),
   timeSinceCapture=os.clock()-(state.lastCaptureAt or os.clock()),
-  counterReason=state.counterReason,nukeReason=state.nukeReason,humanFinishReason=state.humanFinishReason,
+  counterReason=state.counterReason,nukeReason=state.nukeReason,humanFinishReason=state.humanFinishReason,containedDefense=state.containedDefense,
   waterReason=state.waterSearchInfo,settings=options})
 end
 function Recorder.render()
@@ -3289,6 +3387,7 @@ function Recorder.tick_inner()
  Recorder.system("Uitbreiding",options.expand and "ingeschakeld" or "uit",state.reason or "wachten op planner")
  local defense=Recorder.systems.Verdediging
  if #state.incoming==0 then Recorder.system("Verdediging",options.defend and "bewaken" or "uit","geen gemelde inkomende fronten")
+ elseif Strategy.contained_attack() then Recorder.system("Verdediging","beheerst","kleine aanval; offensief blijft actief met thuisreserve")
  elseif not defense or now-defense.at>3 then Recorder.system("Verdediging",options.defend and "bedreigd" or "uit",state.counterReason or "inkomende fronten beoordelen") end
  Recorder.sample();Recorder.decisions();Recorder.flush(false);Recorder.render()
  if state.phase~=Recorder.lastPhase then
@@ -3341,6 +3440,7 @@ local function run_step()
     state.planContext={}
     local before=state.orderSerial or 0
     local ok,result=xpcall(function()
+        Strategy.repair_map_if_needed()
         if not Strategy.fast_front_step() then run_step_inner() end
         if state.phase=="playing" then Strategy.target_diagnostics() end
         if (state.orderSerial or 0)==before and Strategy.interleave_ready("build") then
