@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.8-route-campaign"
+local VERSION="6.9-water-recovery"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -737,7 +737,7 @@ task.spawn(function()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.8",VERSION,VERSION)
+]=],snapshot,RAW_URL.."?v=6.9",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1509,6 +1509,91 @@ function Strategy.contacts()
     end
     return contacts
 end
+function Strategy.water_failure(id,entry,reason)
+    local now=os.clock()
+    state.waterFailures=state.waterFailures or {}
+    local count=1
+    for i=#state.waterFailures,1,-1 do
+        local old=state.waterFailures[i]
+        if now-old.at>600 then table.remove(state.waterFailures,i)
+        elseif old.id==id and Strategy.distance(old.tile,entry.tile)<96 then count=math.max(count,old.count+1);table.remove(state.waterFailures,i) end
+    end
+    local pause=math.min(240,45*count)
+    state.waterFailures[#state.waterFailures+1]={id=id,tile=entry.tile,at=now,untilTime=now+pause,count=count}
+    while #state.waterFailures>64 do table.remove(state.waterFailures,1) end
+    state.waterOwnerRetry=state.waterOwnerRetry or {}
+    if count>=3 then state.waterOwnerRetry[id]=now+60 end
+    state.blockedLanding[entry.tile]=now+pause
+    state.lastWaterScan=-10000
+    Recorder.emit("water_route_failed",{id=id,tile=entry.tile,reason=reason,attempts=count,retryAfter=pause})
+    log("WATER: route naar "..id.." niet geslaagd ("..reason.."); andere kust zoeken")
+end
+function Strategy.water_penalty(tile,id)
+    local now=os.clock()
+    if (state.waterOwnerRetry and (state.waterOwnerRetry[id] or 0)>now)
+        or (state.blockedLanding[tile] or 0)>now then return nil end
+    local penalty=0
+    for _,old in ipairs(state.waterFailures or {}) do
+        local distance=Strategy.distance(tile,old.tile)
+        if old.id==id and distance<math.min(144,48*old.count) and old.untilTime>now then return nil end
+        if old.id==id and distance<192 and now-old.at<600 then penalty+=math.max(0,192-distance)*old.count end
+    end
+    return penalty
+end
+function Strategy.poll_transports()
+    if not state.ready or state.phase~="playing" then return end
+    local now=os.clock()
+    if now-(state.lastTransportPoll or -10000)<0.5 then return end
+    state.lastTransportPoll=now
+    local assigned={}
+    for _,entry in pairs(state.riverOrders or {}) do if entry.vehicleId then assigned[entry.vehicleId]=entry end end
+    for id,entry in pairs(state.riverOrders or {}) do
+        if not entry.failed then
+            local landed=state.ready and state.owners and buffer.readu8(state.owners,entry.tile)==state.id
+            for _,front in ipairs(state.outgoing) do
+                if front.id==id and entry.at and (state.lastFronts or 0)>entry.at
+                    and not (entry.fronts or {})[front.aid or front.id] then landed=true end
+            end
+            if landed then
+                state.riverOrders[id]=nil;state.lastWaterScan=-10000
+                Recorder.emit("water_landed",{id=id,tile=entry.tile,elapsed=entry.at and now-entry.at})
+            else
+                local visible=false
+                local reliable=state.transportKnown==true and now-(state.lastVehicles or -10000)<5
+                if reliable then
+                    for _,vehicle in ipairs(state.vehicles or {}) do
+                        if vehicle.owner==state.id and vehicle.kind==3 and type(vehicle.id)=="number" and not (entry.existingBoats or {})[vehicle.id] then
+                            if not entry.vehicleId and not assigned[vehicle.id] then entry.vehicleId=vehicle.id;assigned[vehicle.id]=entry end
+                            if vehicle.id==entry.vehicleId then
+                                visible=true;entry.seenAt=now
+                                if vehicle.x~=entry.x or vehicle.y~=entry.y then entry.movedAt=now;entry.x=vehicle.x;entry.y=vehicle.y end
+                            end
+                        end
+                    end
+                end
+                local gone=reliable and entry.seenAt and not visible and now-entry.seenAt>=5
+                local expired=now>=entry.untilTime and not visible
+                local stuck=visible and entry.movedAt and now-entry.movedAt>=30
+                if gone or expired or stuck then
+                    Strategy.water_failure(id,entry,gone and "boot verdwenen zonder landing" or stuck and "boot maakt geen voortgang" or "geen landing bevestigd binnen routevenster")
+                    state.riverOrders[id]=nil
+                end
+            end
+        elseif entry.untilTime<=now then state.riverOrders[id]=nil end
+    end
+end
+function Strategy.water_threats()
+    local threats={}
+    if state.transportKnown==true and os.clock()-(state.lastVehicles or -10000)<5 then
+        for _,v in ipairs(state.vehicles or {}) do
+            if v.kind==4 and not friendly(v.owner) and type(v.x)=="number" and type(v.y)=="number" then
+                threats[#threats+1]={x=v.x,y=v.y,radius=Config.GUNBOAT_TARGET_RANGE or 130}
+                if #threats>=128 then break end
+            end
+        end
+    end
+    return threats
+end
 function Strategy.water_targets()
     if not options.rivers then state.waterTargets={};state.island=false;state.waterSearchInfo="Wateroversteken staat uit";return state.waterTargets end
     if os.clock()-(state.lastWaterScan or -10000)<6 then return state.waterTargets or {} end
@@ -1517,7 +1602,7 @@ function Strategy.water_targets()
     local landExit=false
     for tile in pairs(state.frontier) do
         local id=buffer.readu8(state.owners,tile)
-        if id==0 or not friendly(id) then landExit=true;break end
+        if Strategy.attack_tile_valid(tile,id) then landExit=true;break end
     end
     local island=not landExit
     local opportunitySea=false
@@ -1528,12 +1613,17 @@ function Strategy.water_targets()
                 and enemy.troops<=me.troops*0.10 and Strategy.city_value(id)>=3 then opportunitySea=true;break end
         end
     end
-    local extended=island or opportunitySea
-    local searchRange=extended and math.max(options.riverRange,options.seaRange) or options.riverRange
-    local searchBudget=extended and math.min(N,100000) or 12000
+    if landExit then state.waterStalledAt=nil else state.waterStalledAt=state.waterStalledAt or os.clock() end
+    local stalled=(state.waterStalledAt and os.clock()-state.waterStalledAt>=45)
+        or os.clock()-(state.lastCaptureAt or os.clock())>=45
+    local extended=island or opportunitySea or stalled
+    local searchRange=extended and math.min(512,math.max(options.riverRange,options.seaRange)*(stalled and 2 or 1)) or options.riverRange
+    local searchBudget=extended and math.min(N,stalled and 180000 or 100000) or 12000
     state.island=island
     local queue,depth,seen,targets={},{},{},{}
     local candidateScores={}
+    local threats=Strategy.water_threats()
+    local candidates={}
     local function landing_value(tile,id,distance)
         local x,y=tile%W,math.floor(tile/W)
         local space=0
@@ -1544,7 +1634,13 @@ function Strategy.water_targets()
                 if passable(other) and buffer.readu8(state.owners,other)==id then space+=1 end
             end
         end
-        return space*8-distance
+        local penalty=Strategy.water_penalty(tile,id)
+        if not penalty then return nil end
+        for _,threat in ipairs(threats) do
+            local dx,dy=x-threat.x,y-threat.y
+            if dx*dx+dy*dy<=threat.radius*threat.radius then penalty+=400 end
+        end
+        return space*8-distance-penalty
     end
     local function push(tile,d)
         if not seen[tile] and #queue<searchBudget then
@@ -1569,10 +1665,20 @@ function Strategy.water_targets()
         neighbours(tile,function(other)
             if passable(other) then
                 local id=buffer.readu8(state.owners,other)
-                if id~=state.id and (id==0 or not friendly(id)) and (state.blockedLanding[other] or 0)<os.clock() then
+                if Strategy.attack_tile_valid(other,id) then
                     local value=landing_value(other,id,d)
-                    if not targets[id] or value>(candidateScores[id] or -math.huge) then
-                        targets[id]={tile=other,distance=d,space=value+d};candidateScores[id]=value
+                    if value then
+                        local list=candidates[id] or {};candidates[id]=list
+                        local slot=nil
+                        for i,entry in ipairs(list) do if Strategy.distance(other,entry.tile)<48 then slot=i;break end end
+                        if not slot and #list<6 then slot=#list+1 end
+                        if not slot then
+                            for i,entry in ipairs(list) do if not slot or entry.value<list[slot].value then slot=i end end
+                        end
+                        if not list[slot] or value>list[slot].value then list[slot]={tile=other,distance=d,space=value+d,value=value} end
+                        if not targets[id] or value>(candidateScores[id] or -math.huge) then
+                            targets[id]={tile=other,distance=d,space=value+d};candidateScores[id]=value
+                        end
                     end
                 end
             elseif d<searchRange and not bit32.btest(buffer.readu8(state.terrain,other),128) then
@@ -1594,10 +1700,31 @@ function Strategy.water_targets()
         local count=0;for _ in pairs(targets) do count+=1 end
         log(state.waterSearchInfo.." | doelen "..count);state.lastSeaLog=os.clock()
     end
-    state.waterTargets=targets
+    state.waterCandidates=candidates;state.waterTargets=targets
     return targets
 end
+function Strategy.water_order(id,entry,attacksAllowed,targets,busy)
+    local me,enemy=state.players[state.id],state.players[id]
+    if not me or not Strategy.attack_tile_valid(entry.tile,id) or not Strategy.water_penalty(entry.tile,id) then return nil end
+    local economic=id==0 or (enemy and enemy.isBot==true)
+    local allowed=(id==0 and options.expand) or (id~=0 and enemy and (options.attack or (options.expand and economic)))
+    if not allowed or (id~=0 and not attacksAllowed) or friendly(id) or busy[id]
+        or (id~=0 and targets[id] and not state.island) then return nil end
+    local pending=state.riverOrders[id]
+    if pending and not pending.failed then return nil end
+    local boat=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
+    if boat<(Config.TRANSPORT_BOAT_MIN_TROOPS or 250)
+        or (id~=0 and (not enemy or not enemy.alive or boat<enemy.troops*(economic and 1.1 or 1.5))) then return nil end
+    local hold=math.max(me.troops*0.35,options.protect and Strategy.risk_reserve() or 0)
+    if me.troops-boat<hold then return nil end
+    local score=id==0 and ((entry.space or 0)-entry.distance*0.25)
+        or Strategy.target_score(id,entry.tile,entry.distance,true)
+    if not score then return nil end
+    score+=(entry.space or 0)*4
+    return score,Config.attackPresets(state.mode)[1] or 0.1,hold
+end
 function Strategy.transport_available()
+    Strategy.poll_transports()
     if not options.rivers then state.transportReason="Wateroversteken staat UIT";return false end
     if os.clock()<(state.transportRetryAt or 0) then state.transportReason="Serverlimiet boten: wachten op herpoging";return false end
     if Strategy.active_orders()>=Strategy.land_front_limit() then state.transportReason="Frontenlimiet: wachten op vrij front";return false end
@@ -1618,18 +1745,22 @@ end
 function Strategy.track_transport(id,tile)
     state.riverOrders=state.riverOrders or {}
     local distance=state.waterTargets and state.waterTargets[id] and state.waterTargets[id].distance or 0
-    state.riverOrders[id]={tile=tile,untilTime=os.clock()+math.max(60,math.min(180,distance*1.5))}
+    local fronts,existing={ },{ }
+    for _,front in ipairs(state.outgoing) do fronts[front.aid or front.id]=true end
+    for _,vehicle in ipairs(state.vehicles or {}) do if vehicle.owner==state.id and vehicle.kind==3 then existing[vehicle.id]=true end end
+    local seconds=math.max(24,math.min(120,distance/math.max(1,(Config.TRANSPORT_BOAT_SPEED or 1)*(Config.TICK_RATE or 10))*4+18))
+    state.riverOrders[id]={tile=tile,at=os.clock(),distance=distance,untilTime=os.clock()+seconds,fronts=fronts,existingBoats=existing}
     if state.transportKnown==false then
         state.lastFallbackTransport=os.clock()
-        Recorder.emit("fallback_transport",{id=id,tile=tile,distance=distance,reason=state.transportReason})
+        Recorder.emit("fallback_transport",{id=id,tile=tile,distance=distance,deadline=seconds,reason=state.transportReason})
     end
 end
 function Strategy.active_orders()
+    Strategy.poll_transports()
     local afloat=state.transportKnown==false and 0 or (state.transportCount or 0)
     local pending=0
     for id,entry in pairs(state.riverOrders or {}) do
-        if entry.untilTime<=os.clock() then state.riverOrders[id]=nil
-        elseif not entry.failed then pending=pending+1 end
+        if not entry.failed then pending=pending+1 end
     end
     return #state.outgoing+math.max(afloat,pending)
 end
@@ -2865,7 +2996,7 @@ function Strategy.capture_round_memory(payload)
     local memory={}
     for _,key in ipairs({"playingAt","lastCaptureAt","lastBreakoutAt","breakout","frontProgress","boosts",
         "territoryGrowth","catchupLeader","catchupActive","orderSerial","lastNuke","lastNukeScan","nukeSalvoCount",
-        "nukeFastBlockedUntil","nukePending","nukeBudgetAfter","defenseCounterAt"}) do memory[key]=state[key] end
+        "nukeFastBlockedUntil","nukePending","nukeBudgetAfter","defenseCounterAt","riverOrders","waterFailures","waterOwnerRetry","waterStalledAt","lastFallbackTransport"}) do memory[key]=state[key] end
     return memory
 end
 function Strategy.restore_round_memory(memory)
@@ -2922,7 +3053,7 @@ local function state_event(kind,payload,extra)
         state.rosterUsers={};state.rejectedSpawn={};state.pendingSpawn=nil;state.spawnTile=nil;state.previewChosen=false;state.frontProgress={};state.territoryGrowth={};state.racePressure=false;state.homeLossRate=0;state.defenseCounterAt=-10000;state.planBorders={};state.counterReason=nil;state.lastDefenseLog=-10000;state.planFrontLimit=nil;state.mapRevision=0;state.orderSerial=0;state.lastTroopOrder=-10000;state.catchupLeader=nil;state.catchupActive=false;state.lastBorderAudit=-10000;state.lastTargetReport=-10000
         state.ownedSamples={};state.structures={};state.structuresReady=false
         state.armies=nil;state.boosts={};state.landOrders={};state.growthProfile=nil;state.measuredGrowth=nil;state.economicStatus=nil;state.lastCaptureAt=-10000
-        state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000
+        state.coast={};state.waterTargets={};state.riverOrders={};state.blockedLanding={};state.transportCount=0;state.lastWaterScan=-10000;state.waterFailures={};state.waterOwnerRetry={};state.waterStalledAt=nil;state.lastTransportPoll=-10000;state.vehicles={};state.lastVehicles=-10000;state.transportKnown=false
         state.blockedBuild={};state.plannedBlasts={};state.gold=nil;state.cityCost=nil;state.postCost=nil
         state.freeCities=0;state.freePosts=0;state.freeNukes=0;state.freeSams=0;state.samCost=nil
         state.reinforceCost=nil;state.reinforceTroops=nil;state.reinforceQuoteAt=nil
@@ -3005,9 +3136,7 @@ local function state_event(kind,payload,extra)
     elseif kind=="fronts" and state.id then
         assert(type(payload.out)=="table" and type(payload.inc)=="table","Onbekend fronts-formaat")
         state.incoming=payload.inc; state.outgoing=payload.out
-        for _,front in ipairs(state.outgoing) do
-            if state.riverOrders then state.riverOrders[front.id]=nil end
-        end
+
         state.levels=payload.levels or 0; state.lastFronts=os.clock()
         state.gold=payload.gold or state.gold;state.cityCost=payload.cost or state.cityCost
         if type(payload.reinforceCost)=="number" and type(payload.reinforceTroops)=="number" and type(payload.reinforceLeft)=="number"
@@ -3026,7 +3155,7 @@ local function state_event(kind,payload,extra)
     elseif kind=="armies" and state.id then
         state.armies=payload
     elseif kind=="vehicles" and state.id then
-        state.transportCount=0
+        state.transportCount=0;state.vehicles=payload;state.lastVehicles=os.clock()
         state.transportKnown=true
         for _,v in ipairs(payload) do
             if v.owner==state.id and v.kind==3 then state.transportCount=state.transportCount+1 end
@@ -3082,7 +3211,7 @@ local function state_event(kind,payload,extra)
                 if entry.tile==command.tile then
                     local route=payload.reason=="nobeach" or payload.reason=="nocoast" or payload.reason=="nosearoute"
                     entry.untilTime=os.clock()+(route and 30 or options.interval);entry.failed=true
-                    if route then state.blockedLanding[command.tile]=os.clock()+60;state.lastWaterScan=-10000 end
+                    if route then Strategy.water_failure(id,entry,"server: "..payload.reason) end
                 end
             end
         end
@@ -3244,6 +3373,7 @@ local function run_step_inner()
     local defending=options.defend and #state.incoming>0
     state.containedDefense=#state.incoming>0 and Strategy.contained_attack()
     if (not defending or state.containedDefense) and (state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100)) then state.reason="Wachten op server na order";return end
+    Strategy.poll_transports()
     Strategy.audit_border()
     local targets=enemy_targets()
     state.containedDefense=#state.incoming>0 and Strategy.contained_attack()
@@ -3329,7 +3459,17 @@ local function run_step_inner()
     local harvestPriority=botHarvest and ((state.cityCost and state.gold and state.gold<state.cityCost) or me.troops<Strategy.capacity(me)*0.65)
         and Strategy.active_orders()<math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
     local treasurePriority=treasureCapture and Strategy.active_orders()<math.min(options.maxFronts,Config.MAX_FRONTS_PER_PLAYER or 4)
-    if not parallelOpportunity and not growthPriority and not harvestPriority and not treasurePriority and Strategy.try_build(false) then return end
+    local waterOpportunity=false
+    if options.rivers and (options.attack or options.expand) and Strategy.transport_available() then
+        local occupied={}
+        for _,front in ipairs(state.outgoing) do occupied[front.id]=true end
+        local grace=state.historical and (state.historical.grace or 0) or (Config.SPAWN_IMMUNITY_SECONDS or 0)
+        local allowed=os.clock()-(state.playingAt or 0)>=grace
+        for id,entry in pairs(state.waterTargets or {}) do
+            if Strategy.water_order(id,entry,allowed,targets,occupied) then waterOpportunity=true;break end
+        end
+    end
+    if not waterOpportunity and not parallelOpportunity and not growthPriority and not harvestPriority and not treasurePriority and Strategy.try_build(false) then return end
     local normalReserve=state.requiredReserve
     local economicRatio=choose_ratio(false,true)
     local economicReserve=state.requiredReserve
@@ -3388,17 +3528,8 @@ local function run_step_inner()
         if Strategy.transport_available() then
             local targetId,target,waterScore,waterRatio,waterReserve=nil,nil,-math.huge,nil,nil
             for id,entry in pairs(state.waterTargets or {}) do
-                local enemy=state.players[id]
-                local economic=id==0 or (enemy and enemy.isBot==true)
-                local orderRatio=economic and economicRatio or Strategy.opportunity_ratio(id,false)
-                local score=id==0 and options.expand and ((entry.space or 0)-entry.distance*0.25) or Strategy.target_score(id,entry.tile,entry.distance)
-                local boat=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
-                local invasionSafe=id==0 or (enemy and boat>=enemy.troops*(enemy.isBot==true and 1.1 or 1.5))
-                local pending=state.riverOrders[id]
-                if invasionSafe and (id==0 or attacksAllowed) and orderRatio and (not economic or economicReady) and score and (id==0 or not targets[id]) and (id==0 or not busy[id]) and not friendly(id)
-                    and (not pending or pending.untilTime<=os.clock()) then
-                    if score>waterScore then targetId,target,waterScore,waterRatio,waterReserve=id,entry,score,orderRatio,economic and economicReserve or normalReserve end
-                end
+                local score,orderRatio,hold=Strategy.water_order(id,entry,attacksAllowed,targets,busy)
+                if score and score>waterScore then targetId,target,waterScore,waterRatio,waterReserve=id,entry,score,orderRatio,hold end
             end
             local boatTroops=math.floor(me.troops/(Config.TRANSPORT_BOAT_TROOP_DIVISOR or 5))
             if target and waterScore>bestScore and boatTroops>=(Config.TRANSPORT_BOAT_MIN_TROOPS or 250)
@@ -3529,7 +3660,7 @@ function Recorder.decisions()
   fronts=state.planFrontLimit or options.maxFronts,lastOrder=state.lastCommand,
   borderTargets=borders,waterTargets=state.waterTargets,transportCount=state.transportCount,
   transportKnown=state.transportKnown,transportReason=state.transportReason,transportRetryAt=state.transportRetryAt,landFrontLimit=Config and Strategy.land_front_limit(),
-  pendingTransports=state.riverOrders,blockedLandings=state.blockedLanding,
+  pendingTransports=state.riverOrders,blockedLandings=state.blockedLanding,waterFailures=state.waterFailures,waterCandidates=state.waterCandidates,
   pendingBlasts=state.plannedBlasts,lastBuild=state.lastBuild,lastNuke=state.lastNuke,
   lastAction=state.lastAction,actionDelay=Config and Strategy.action_delay(),
   timeSinceCapture=os.clock()-(state.lastCaptureAt or os.clock()),
