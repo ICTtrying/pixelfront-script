@@ -1,5 +1,5 @@
 -- Luau | FrontPanel_v2.lua | Roblox client | Pixel Front
-local VERSION="6.4.3-single-city"
+local VERSION="6.5-verified-mechanics"
 local RAW_URL="https://raw.githubusercontent.com/ICTtrying/pixelfront-script/main/FrontPanel_v2.lua"
 local Players=game:GetService("Players")
 local RS=game:GetService("ReplicatedStorage")
@@ -15,7 +15,7 @@ local alive=true
 local connections={}
 local options={queue=false,spawn=false,expand=false,attack=false,defend=false,leave=false,
  dry=false,reserve=45,strength=2,interval=3,reload=true,skipHistorical=false,
- protect=true,cities=true,posts=true,nukes=false,preemptNukes=true,upgradeCities=true,
+ protect=true,cities=true,posts=true,nukes=false,adaptiveNukeSalvo=true,fastFrontReinforce=true,preemptNukes=true,upgradeCities=true,
  goldReserve=100000,minCluster=3,nukeDelay=60,maxCities=10,maxCityLevel=3,buildDelay=8,
  rivers=true,sams=true,maxFronts=3,riverRange=24,seaRange=192,maxSams=4,botCities=true,preserveBotCities=true,
  recordData=true,growthAware=true,catchUp=true,adaptiveTempo=true,parallelActions=true,buyReinforcements=true,reinforce=true,growthFloor=25,reinforceDelay=6,maxBoosts=2}
@@ -605,6 +605,9 @@ local ui_ok,ui_error=xpcall(function()
  number_input("Instellen","Sterkteverhouding","strength",1.2,10)
  number_input("Instellen","Actievertraging in seconden","interval",2,30)
  toggle("Instellen","Veilige steden upgraden","upgradeCities")
+ toggle("Instellen","Maximaal twee bevestigde silo-vrije nukes per salvo","adaptiveNukeSalvo")
+ toggle("Instellen","Lopend front sneller aanvullen","fastFrontReinforce")
+ label("Instellen","Nukes blijven afhankelijk van goud, reserve en veilige doelen. Een volgende bom wacht op lancering en nieuw goudsaldo. Reinforcement kopen houdt de serverwachttijd; frontaanvulling verplaatst bestaande troepen.",100)
  number_input("Instellen","Goud achterhouden","goldReserve",0,10000000)
  number_input("Instellen","Maximaal aantal steden","maxCities",1,40)
  number_input("Instellen","Maximaal stadsniveau","maxCityLevel",1,10)
@@ -723,13 +726,15 @@ task.spawn(function()
    getgenv().FrontPanelSettings=game:GetService("HttpService"):JSONDecode(%q)
   end
   local source=game:HttpGet(%q)
+  local remote_version=source:match('local%%s+VERSION%%s*=%%s*"([^"\n]+)"')
+  assert(remote_version==%q,"GitHub bevat versie "..tostring(remote_version).."; verwacht "..%q..". Voer het gedownloade 6.5-bestand opnieuw uit.")
   local run,compile_error=loadstring(source)
   assert(run,compile_error)
   run()
  end)
  if not ok then warn("[FrontPanel herladen] "..tostring(err)) end
 end)
-]=],snapshot,RAW_URL.."?v=6.4.3")
+]=],snapshot,RAW_URL.."?v=6.5",VERSION,VERSION)
   local ok,err=pcall(queue_function,payload)
   if ok then
    state.teleportQueued=true
@@ -1836,9 +1841,17 @@ function Strategy.interleave_ready(kind)
     return false
 end
 function Strategy.order_ready(kind)
+    if kind=="attack" and state.fastFrontOrder and options.fastFrontReinforce then
+        return os.clock()-state.lastAction>=0.5
+    end
     return os.clock()-state.lastAction>=Strategy.action_delay() or Strategy.interleave_ready(kind)
 end
 local function send(payload,description)
+    if (payload.t=="build" or payload.t=="reinforce") and (state.nukePending
+        or (state.nukeBudgetAfter and state.lastFronts<=state.nukeBudgetAfter)) then
+        state.reason="Wachten op bevestigd nuke-budget voordat opnieuw goud wordt uitgegeven"
+        return false
+    end
     if payload.t=="attack" and state.blockedAttack and (state.blockedAttack[payload.tile] or 0)>os.clock() then return false end
     if payload.t=="attack" and state.owners and type(payload.tile)=="number"
         and payload.tile>=0 and payload.tile<buffer.len(state.owners) and buffer.readu8(state.owners,payload.tile)==state.id then
@@ -1866,27 +1879,72 @@ local function send(payload,description)
     log("ORDER: "..description)
     return true
 end
+function Strategy.nuke_interval()
+    if not options.adaptiveNukeSalvo or Config.NUKE_REQUIRES_SILO~=false
+        or os.clock()<(state.nukeFastBlockedUntil or 0) then return options.nukeDelay end
+    for _,structure in pairs(state.structures or {}) do
+        if structure.ownerId==state.id and structure.kind==4 then return options.nukeDelay end
+    end
+    if (state.nukeSalvoCount or 0)>=2 and os.clock()-(state.lastNuke or -10000)<options.nukeDelay then
+        return options.nukeDelay
+    end
+    return math.min(options.nukeDelay,1)
+end
+function Strategy.observe_missiles(payload)
+    if type(payload)~="table" then return end
+    for _,event in ipairs(payload) do
+        if type(event)=="table" and event.e=="l" and event.owner==state.id and event.kind==13 then
+            local pending=state.nukePending
+            if pending and pending.tile==event.dst and pending.generation==state.generation then
+                state.nukePending=nil;state.nukeBudgetAfter=os.clock()
+                for _,blast in ipairs(state.plannedBlasts or {}) do
+                    if blast.tile==event.dst and blast.sentAt==pending.at then blast.unitId=event.id end
+                end
+                Recorder.emit("nuke_launch_confirmed",{tile=event.dst,id=event.id,serial=pending.serial})
+                log("Nuke-lancering bevestigd; nieuw goudsaldo afwachten.")
+            end
+        elseif type(event)=="table" and event.e=="b" then
+            for i=#(state.plannedBlasts or {}),1,-1 do
+                if state.plannedBlasts[i].unitId==event.id then table.remove(state.plannedBlasts,i) end
+            end
+        end
+    end
+end
 function Strategy.try_nuke()
     if not options.nukes then state.nukeReason="UIT: schakel Strategische atoomnukes in";return false end
-    if os.clock()-(state.lastNuke or -10000)<options.nukeDelay then state.nukeReason="Wachten op nuke-interval";return false end
+    if state.nukePending then
+        state.nukeReason=os.clock()-state.nukePending.at>8 and "Lancering niet bevestigd; synchroniseer opnieuw" or "Wachten op nuke-lancering"
+        return false
+    end
+    if state.nukeBudgetAfter and state.lastFronts<=state.nukeBudgetAfter then
+        state.nukeReason="Wachten op nieuw goudsaldo na lancering";return false
+    end
+    local interval=Strategy.nuke_interval()
+    if os.clock()-(state.lastNuke or -10000)<interval then state.nukeReason="Wachten op nuke-interval";return false end
     if not state.structuresReady or not state.gold then state.nukeReason="Wachten op gebouw- en goudgegevens";return false end
     local free=(state.freeNukes or 0)>0
-    if not free and state.gold-(Config.ATOM_BOMB_COST or 750000)<options.goldReserve then
-        state.nukeReason="Onvoldoende nuke-budget: prijs "..tostring(Config.ATOM_BOMB_COST or 750000).." plus reserve "..options.goldReserve
+    local cost=Config.ATOM_BOMB_COST or 750000
+    if not free and state.gold-cost<options.goldReserve then
+        state.nukeReason="Onvoldoende nuke-budget: prijs "..tostring(cost).." plus reserve "..options.goldReserve
         return false
     end
     if Config.NUKE_REQUIRES_SILO~=false then
         state.nukeReason="Nukeplanner wacht op ondersteunde siloregels";return false
     end
-    if os.clock()-(state.lastNukeScan or -10000)<8 then return false end
+    if os.clock()-(state.lastNukeScan or -10000)<math.min(8,interval) then return false end
     state.lastNukeScan=os.clock()
     local candidate=Strategy.cluster_candidate(true)
     if not candidate then state.nukeReason="Geen waardevol vrij doel zonder eigen/geallieerde schade of bekende SAM-dekking";return false end
     if send({t="nuke",tile=candidate.tile,kind=13},"STRATEGISCHE NUKE: "..(candidate.reason or "vijandelijk cluster").." | huizen "..candidate.count) then
-        state.lastNuke=os.clock();state.lastSend=os.clock();state.nukeReason="Verstuurd: "..(candidate.reason or "cluster")
-        table.insert(state.plannedBlasts,{tile=candidate.tile,untilTime=os.clock()+180})
+        local now=os.clock()
+        if now-(state.lastNuke or -10000)>=options.nukeDelay then state.nukeSalvoCount=0 end
+        state.nukeSalvoCount=(state.nukeSalvoCount or 0)+1
+        state.lastNuke=now;state.lastSend=now;state.nukeReason="Verstuurd: "..(candidate.reason or "cluster")
+        state.nukePending={tile=candidate.tile,at=now,generation=state.generation,serial=state.orderSerial}
+        table.insert(state.plannedBlasts,{tile=candidate.tile,sentAt=now,untilTime=now+180})
+        return true
     end
-    return true
+    return false
 end
 function Strategy.try_buy_reinforcements()
     if not options.buyReinforcements then return false end
@@ -1904,9 +1962,9 @@ function Strategy.try_buy_reinforcements()
     local need=Strategy.risk_reserve()
     local emergency=#state.incoming>0 or me.troops<need*1.15
     local active=#state.outgoing>0
-    local useful=benefit>=math.min(cap*0.10,troops*0.80)
+    local useful=benefit>0 and (emergency or benefit>=math.min(cap*0.10,troops*0.80))
     if benefit<=0 or not useful then return false end
-    if not emergency and (not active or me.troops>=cap*0.65 or state.gold-cost<options.goldReserve) then return false end
+    if not emergency and (not active or state.gold-cost<options.goldReserve) then return false end
     if send({t="reinforce"},"reinforcement kopen: +"..math.floor(benefit).." troepen voor "..math.floor(cost).." goud") then
         state.lastSend=os.clock();state.reinforcePendingUntil=os.clock()+8
         return true
@@ -2221,6 +2279,37 @@ function Strategy.quick_campaign(targets)
  state.campaignUrgencyAt=nil
  return false
 end
+function Strategy.front_reinforce_delay(id,me,front,fastFinish,neutralNeed)
+    if options.fastFrontReinforce then return math.min(options.reinforceDelay,0.5) end
+    if options.adaptiveTempo and me.troops>=Strategy.capacity(me)*0.70 and (id==0 or fastFinish) then
+        return math.min(options.reinforceDelay,2)
+    end
+    if options.adaptiveTempo and id==0 and neutralNeed and front.troops<neutralNeed*0.50 then
+        return math.min(options.reinforceDelay,2)
+    end
+    return options.reinforceDelay
+end
+function Strategy.fast_front_step()
+    if not options.fastFrontReinforce or not options.reinforce or options.dry or not alive or not state.ready
+        or state.phase~="playing" or state.engineFault or state.awaitingInit
+        or (state.protocolBlocks and next(state.protocolBlocks)) or not fresh() or #state.incoming>0
+        or #state.outgoing==0 or os.clock()-state.lastAction<0.5
+        or os.clock()-state.lastAction>=Strategy.action_delay()
+        or state.lastPlayers<=(state.lastSend or -100) or state.lastFronts<=(state.lastSend or -100) then return false end
+    local me=state.players[state.id]
+    if not me or not me.alive then return false end
+    local normalRatio=choose_ratio(false)
+    local normalReserve=state.requiredReserve
+    local economicRatio=choose_ratio(false,true)
+    state.economicReserve=state.requiredReserve;state.requiredReserve=normalReserve
+    local economicReady=Strategy.growth_ready(economicRatio)
+    local before=state.orderSerial or 0
+    state.fastFrontOrder=true
+    local ok,err=pcall(Strategy.try_reinforce,enemy_targets(),normalRatio,economicRatio,economicReady)
+    state.fastFrontOrder=nil
+    if not ok then error(err,0) end
+    return (state.orderSerial or 0)>before
+end
 function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
     if not options.reinforce or #state.outgoing==0 then return false end
     local me=state.players[state.id]
@@ -2291,9 +2380,7 @@ function Strategy.try_reinforce(targets,normalRatio,economicRatio,economicReady)
         local eligible=id==0 or breakout or fastFinish or Strategy.target_score(id,tile or 0,0)~=nil
         if enabled and ratio and tile and eligible and not friendly(id)
             and (not options.protect or not state.targetProtected[id] or breakout or fastFinish)
-            and now-record.at>=(options.adaptiveTempo and me.troops>=Strategy.capacity(me)*0.70
-                and (id==0 or fastFinish) and math.min(options.reinforceDelay,2) or
-                (options.adaptiveTempo and id==0 and neutralNeed and front.troops<neutralNeed*0.50 and math.min(options.reinforceDelay,2) or options.reinforceDelay))
+            and now-record.at>=Strategy.front_reinforce_delay(id,me,front,fastFinish,neutralNeed)
             and record.bursts<options.maxBoosts then
             local committed=math.floor(me.troops*ratio)
             local depleted=front.troops<committed*0.5
@@ -2495,6 +2582,7 @@ local function state_event(kind,payload,extra)
         state.reinforceCost=nil;state.reinforceTroops=nil;state.reinforceQuoteAt=nil
         state.boxedSince=nil;state.lastBreakoutAt=nil;state.breakout=nil
         state.reinforceReadyAt=nil;state.reinforceCooldownUntil=0;state.reinforcePendingUntil=0;state.reinforceDenied=false
+        state.nukePending=nil;state.nukeBudgetAfter=nil;state.nukeSalvoCount=0;state.nukeFastBlockedUntil=0;state.fastFrontOrder=nil
         state.lastBuild=-10000;state.lastNuke=-10000;state.lastNukeScan=-10000
         state.requiredReserve=nil;state.neighbourCount=0;state.strongestNeighbour=0
         local roster=message_list("roster",payload.roster or {},false)
@@ -2584,6 +2672,8 @@ local function state_event(kind,payload,extra)
         state.freeCities=payload.freeCities or 0;state.freePosts=payload.freePosts or 0;state.freeNukes=payload.freeNukes or 0
         state.allies={}
         for _,id in ipairs(payload.diplo and payload.diplo.allies or {}) do state.allies[id]=true end
+    elseif kind=="missiles" and state.id then
+        Strategy.observe_missiles(payload)
     elseif kind=="armies" and state.id then
         state.armies=payload
     elseif kind=="vehicles" and state.id then
@@ -2630,6 +2720,14 @@ local function state_event(kind,payload,extra)
             state.spawnAt=-100
         end
         local command=state.lastCommand
+        if state.nukePending and ((payload.kind==13 and payload.tile==state.nukePending.tile) or (command and command.t=="nuke")) then
+            local pending=state.nukePending
+            for i=#state.plannedBlasts,1,-1 do
+                if state.plannedBlasts[i].sentAt==pending.at then table.remove(state.plannedBlasts,i) end
+            end
+            state.nukePending=nil;state.nukeBudgetAfter=os.clock()
+            if payload.reason=="cooldown" or payload.reason=="nosilo" then state.nukeFastBlockedUntil=os.clock()+options.nukeDelay end
+        end
         if command and command.t=="attack" and state.riverOrders then
             for id,entry in pairs(state.riverOrders) do
                 if entry.tile==command.tile then
@@ -3162,7 +3260,7 @@ local function run_step()
     state.planContext={}
     local before=state.orderSerial or 0
     local ok,result=xpcall(function()
-        run_step_inner()
+        if not Strategy.fast_front_step() then run_step_inner() end
         if state.phase=="playing" then Strategy.target_diagnostics() end
         if (state.orderSerial or 0)==before and Strategy.interleave_ready("build") then
             if #state.incoming>0 then Strategy.try_build(true)
